@@ -6,6 +6,7 @@ const fs = require("fs");
 const { fal } = require("@fal-ai/client");
 const { execFile } = require("child_process");
 const { promisify } = require("util");
+const ffmpegPath = require("ffmpeg-static");
 
 const execFileAsync = promisify(execFile);
 
@@ -46,7 +47,6 @@ if (process.env.FAL_KEY) {
 }
 
 const MODELS = {
-  topaz: "fal-ai/topaz/upscale/video",
   crystal: "clarityai/crystal-video-upscaler",
   film: "fal-ai/film/video",
   reframe: "fal-ai/luma-dream-machine/ray-2/reframe",
@@ -165,13 +165,17 @@ async function downloadRemoteVideoToLocal(videoUrl) {
   }
 
   const buffer = Buffer.from(await response.arrayBuffer());
-  const ext =
-    path.extname(new URL(videoUrl).pathname).split("?")[0] ||
-    ".mp4";
+
+  let ext = ".mp4";
+  try {
+    const pathname = new URL(videoUrl).pathname;
+    const parsedExt = path.extname(pathname);
+    if (parsedExt) ext = parsedExt;
+  } catch (_) {}
 
   const localPath = path.join(
     uploadsDir,
-    `remote-${Date.now()}-${Math.round(Math.random() * 1e9)}${ext || ".mp4"}`
+    `remote-${Date.now()}-${Math.round(Math.random() * 1e9)}${ext}`
   );
 
   fs.writeFileSync(localPath, buffer);
@@ -213,21 +217,12 @@ function buildVideoPipeline(options = {}) {
   const wantsColorBoost = smartMode || toBool(options.enableColorBoost);
   const wantsSocialExport = smartMode || toBool(options.enableSocialExport);
 
+  // تعطيل Topaz مؤقتًا لأنه سبب 422
   if (wantsDenoise || wantsSharpen) {
     steps.push({
-      key: "topazEnhance",
-      label: "Topaz Enhance",
-      type: "fal",
-      model: MODELS.topaz,
-      buildInput: (videoUrl, opts) => ({
-        video_url: videoUrl,
-        model: wantsDenoise ? "Artemis HQ" : "Proteus",
-        upscale_factor: mapUpscaleFactor(opts.qualityLevel),
-        noise: wantsDenoise ? 0.35 : 0.1,
-        recover_detail: wantsSharpen ? 0.3 : 0.15,
-        compression: 0.2,
-        halo: 0.05,
-      }),
+      key: "detailPrep",
+      label: "Detail Prep",
+      type: "skip",
     });
   }
 
@@ -411,9 +406,7 @@ async function runFfmpegStep(job, step, inputVideoUrl, stepIndex, publicBaseUrl)
   const args = buildFfmpegArgs(resolved.inputPath, outputPath, job.options);
 
   try {
-    const ffmpegPath = require("ffmpeg-static");
-
-await execFileAsync(ffmpegPath, args);
+    await execFileAsync(ffmpegPath, args);
   } finally {
     if (resolved.isTemp && fs.existsSync(resolved.inputPath)) {
       fs.unlinkSync(resolved.inputPath);
@@ -426,6 +419,15 @@ await execFileAsync(ffmpegPath, args);
   return `${publicBaseUrl}/uploads/${path.basename(outputPath)}`;
 }
 
+async function runSkipStep(job, step, inputVideoUrl, stepIndex) {
+  job.currentStep = step.key;
+  job.currentStepLabel = step.label;
+  job.currentModel = null;
+  job.progress = computeProgress(stepIndex, job.totalSteps, "done");
+  job.completedSteps = stepIndex + 1;
+  return inputVideoUrl;
+}
+
 async function runPipeline(job, initialVideoUrl, publicBaseUrl) {
   const steps = buildVideoPipeline(job.options);
 
@@ -433,7 +435,7 @@ async function runPipeline(job, initialVideoUrl, publicBaseUrl) {
     key: step.key,
     label: step.label,
     type: step.type,
-    model: step.model || "ffmpeg",
+    model: step.model || null,
   }));
 
   job.totalSteps = steps.length;
@@ -468,6 +470,8 @@ async function runPipeline(job, initialVideoUrl, publicBaseUrl) {
         i,
         publicBaseUrl
       );
+    } else if (step.type === "skip") {
+      currentVideoUrl = await runSkipStep(job, step, currentVideoUrl, i);
     }
   }
 
