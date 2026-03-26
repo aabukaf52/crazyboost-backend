@@ -240,19 +240,16 @@ function buildVideoPipeline(options = {}) {
   }
 
   if (wantsFrameSmoothing) {
-    steps.push({
-      key: "frameSmoothing",
-      label: "Frame Smoothing",
-      type: "fal",
-      model: MODELS.film,
-      buildInput: (videoUrl) => ({
-        video_url: videoUrl,
-        num_frames: 1,
-        use_scene_detection: true,
-        use_calculated_fps: true,
-      }),
-    });
-  }
+  steps.push({
+    key: "frameSmoothing",
+    label: "Frame Smoothing",
+    type: "fal",
+    model: MODELS.film,
+    buildInput: (videoUrl) => ({
+      video_url: videoUrl
+    }),
+  });
+}
 
   if (wantsReframing) {
     steps.push({
