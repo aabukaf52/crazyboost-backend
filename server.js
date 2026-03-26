@@ -3,8 +3,10 @@ const cors = require("cors");
 const multer = require("multer");
 const path = require("path");
 const fs = require("fs");
+const { fal } = require("@fal-ai/client");
 
 const app = express();
+app.set("trust proxy", true);
 
 const uploadsDir = path.join(__dirname, "uploads");
 
@@ -33,12 +35,52 @@ app.use("/uploads", express.static(uploadsDir));
 
 const jobs = {};
 
+if (process.env.FAL_KEY) {
+  fal.config({
+    credentials: process.env.FAL_KEY,
+  });
+}
+
+function getPublicBaseUrl(req) {
+  return `${req.protocol}://${req.get("host")}`;
+}
+
+function buildAppliedEnhancements(options = {}) {
+  const items = [];
+
+  if (options.enableUpscale === "true") items.push("Upscale");
+  if (options.enableDenoise === "true") items.push("Denoise");
+  if (options.enableSharpen === "true") items.push("Sharpen");
+  if (options.enableColorBoost === "true") items.push("Color Boost");
+  if (options.enableFrameSmoothing === "true") items.push("Frame Smoothing");
+  if (options.enableSocialExport === "true") items.push("Social Export");
+
+  return items;
+}
+
+function mapTargetResolution(qualityLevel) {
+  if (qualityLevel === "Ultra") return "1080p";
+  return "720p";
+}
+
+function mapCreativity(options = {}) {
+  if (options.smartMode === "true") return 1;
+  return 1;
+}
+
 app.get("/", (req, res) => {
   res.json({ message: "CrazyBoost backend is running" });
 });
 
-app.post("/enhance", upload.single("video"), (req, res) => {
+app.post("/enhance", upload.single("video"), async (req, res) => {
   try {
+    if (!process.env.FAL_KEY) {
+      return res.status(500).json({
+        success: false,
+        error: "FAL_KEY is missing in environment variables",
+      });
+    }
+
     if (!req.file) {
       return res.status(400).json({
         success: false,
@@ -47,41 +89,65 @@ app.post("/enhance", upload.single("video"), (req, res) => {
     }
 
     const jobId = Date.now().toString();
+    const publicBaseUrl = getPublicBaseUrl(req);
+    const publicVideoUrl = `${publicBaseUrl}/uploads/${req.file.filename}`;
+
+    const options = req.body || {};
+    const appliedEnhancements = buildAppliedEnhancements(options);
+
+    console.log("Video received:", req.file.originalname);
+    console.log("Stored as:", req.file.filename);
+    console.log("Public video URL:", publicVideoUrl);
+    console.log("Options:", options);
+    console.log("Job created:", jobId);
 
     jobs[jobId] = {
       id: jobId,
       fileName: req.file.originalname,
       storedFileName: req.file.filename,
-      resultUrl: `/uploads/${req.file.filename}`,
-      options: req.body,
+      originalUrl: publicVideoUrl,
+      resultUrl: null,
+      options,
+      appliedEnhancements,
       status: "processing",
-      progress: 0,
+      progress: 5,
       createdAt: Date.now(),
+      falRequestId: null,
+      falModel: "fal-ai/wan-vision-enhancer",
+      error: null,
     };
 
-    console.log("Video received:", req.file.originalname);
-    console.log("Stored as:", req.file.filename);
-    console.log("Options:", req.body);
-    console.log("Job created:", jobId);
+    const submitResult = await fal.queue.submit("fal-ai/wan-vision-enhancer", {
+      input: {
+        video_url: publicVideoUrl,
+        target_resolution: mapTargetResolution(options.qualityLevel),
+        creativity: mapCreativity(options),
+        prompt: "",
+      },
+    });
+
+    jobs[jobId].falRequestId = submitResult.request_id;
+    jobs[jobId].progress = 15;
 
     return res.json({
       success: true,
       message: "Video received successfully",
-      jobId: jobId,
+      jobId,
       fileName: req.file.originalname,
-      options: req.body,
+      options,
     });
   } catch (error) {
     console.error("Enhance error:", error);
 
     return res.status(500).json({
       success: false,
-      error: "Server error",
+      error: "Server error while submitting AI job",
+      details: error.message,
     });
   }
 });
 
-app.get("/status/:jobId", (req, res) => {
+app.get("/status/:jobId", async (req, res) => {
   try {
     const { jobId } = req.params;
     const job = jobs[jobId];
@@ -93,23 +159,47 @@ app.get("/status/:jobId", (req, res) => {
       });
     }
 
-    const elapsedSeconds = Math.floor((Date.now() - job.createdAt) / 1000);
-
-    let progress = 0;
-    let status = "processing";
-
-    if (elapsedSeconds >= 1) progress = 15;
-    if (elapsedSeconds >= 2) progress = 35;
-    if (elapsedSeconds >= 3) progress = 55;
-    if (elapsedSeconds >= 4) progress = 75;
-    if (elapsedSeconds >= 5) progress = 90;
-    if (elapsedSeconds >= 6) {
-      progress = 100;
-      status = "done";
+    if (!job.falRequestId) {
+      return res.json({
+        success: true,
+        jobId: job.id,
+        fileName: job.fileName,
+        status: job.status,
+        progress: job.progress,
+      });
     }
 
-    job.progress = progress;
-    job.status = status;
+    if (job.status === "done" || job.status === "failed") {
+      return res.json({
+        success: true,
+        jobId: job.id,
+        fileName: job.fileName,
+        status: job.status,
+        progress: job.progress,
+      });
+    }
+
+    const falStatus = await fal.queue.status(job.falModel, {
+      requestId: job.falRequestId,
+      logs: true,
+    });
+
+    const falState = falStatus.status;
+
+    if (falState === "IN_QUEUE") {
+      job.status = "processing";
+      job.progress = 20;
+    } else if (falState === "IN_PROGRESS") {
+      job.status = "processing";
+      job.progress = 70;
+    } else if (falState === "COMPLETED") {
+      job.status = "done";
+      job.progress = 100;
+    } else if (falState === "FAILED" || falState === "CANCELLED") {
+      job.status = "failed";
+      job.progress = 100;
+      job.error = "AI processing failed";
+    }
 
     return res.json({
       success: true,
@@ -124,11 +214,12 @@ app.get("/status/:jobId", (req, res) => {
     return res.status(500).json({
       success: false,
       error: "Server error",
+      details: error.message,
     });
   }
 });
 
-app.get("/result/:jobId", (req, res) => {
+app.get("/result/:jobId", async (req, res) => {
   try {
     const { jobId } = req.params;
     const job = jobs[jobId];
@@ -140,12 +231,51 @@ app.get("/result/:jobId", (req, res) => {
       });
     }
 
-    if (job.status !== "done") {
+    if (job.status === "failed") {
       return res.status(400).json({
         success: false,
-        error: "Processing not finished yet",
+        error: job.error || "Processing failed",
       });
     }
+
+    if (!job.falRequestId) {
+      return res.status(400).json({
+        success: false,
+        error: "AI request not created yet",
+      });
+    }
+
+    if (job.status !== "done") {
+      const falStatus = await fal.queue.status(job.falModel, {
+        requestId: job.falRequestId,
+        logs: false,
+      });
+
+      if (falStatus.status !== "COMPLETED") {
+        return res.status(400).json({
+          success: false,
+          error: "Processing not finished yet",
+        });
+      }
+
+      job.status = "done";
+      job.progress = 100;
+    }
+
+    const result = await fal.queue.result(job.falModel, {
+      requestId: job.falRequestId,
+    });
+
+    const resultUrl = result?.data?.video?.url || null;
+
+    if (!resultUrl) {
+      return res.status(500).json({
+        success: false,
+        error: "No result video returned from AI",
+      });
+    }
+
+    job.resultUrl = resultUrl;
 
     return res.json({
       success: true,
@@ -153,7 +283,7 @@ app.get("/result/:jobId", (req, res) => {
       fileName: job.fileName,
       status: job.status,
       resultUrl: job.resultUrl,
-      appliedEnhancements: [],
+      appliedEnhancements: job.appliedEnhancements,
     });
   } catch (error) {
     console.error("Result error:", error);
@@ -161,6 +291,7 @@ app.get("/result/:jobId", (req, res) => {
     return res.status(500).json({
       success: false,
       error: "Server error",
+      details: error.message,
     });
   }
 });
