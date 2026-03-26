@@ -113,11 +113,11 @@ app.post("/enhance", upload.single("video"), async (req, res) => {
       progress: 5,
       createdAt: Date.now(),
       falRequestId: null,
-      falModel: "fal-ai/wan-vision-enhancer",
+      falModel: "fal-ai/topaz/upscale/video",
       error: null,
     };
 
-    const submitResult = await fal.queue.submit("fal-ai/wan-vision-enhancer", {
+    const submitResult = await fal.queue.submit("fal-ai/topaz/upscale/video", {
       input: {
         video_url: publicVideoUrl,
         target_resolution: mapTargetResolution(options.qualityLevel),
