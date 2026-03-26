@@ -1,18 +1,23 @@
 {
   "name": "crazyboost_backend",
   "version": "1.0.0",
-  "description": "",
+  "description": "CrazyBoost video enhancement backend",
   "main": "server.js",
+  "type": "commonjs",
   "scripts": {
     "start": "node server.js"
   },
-  "keywords": [],
+  "keywords": [
+    "video",
+    "fal",
+    "express",
+    "ai",
+    "upscale"
+  ],
   "author": "",
   "license": "ISC",
-  "type": "commonjs",
   "dependencies": {
     "@fal-ai/client": "^1.9.5",
-    "axion": "^0.1.0",
     "cors": "^2.8.6",
     "express": "^5.2.1",
     "multer": "^2.1.1"

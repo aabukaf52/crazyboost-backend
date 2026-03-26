@@ -4,6 +4,10 @@ const multer = require("multer");
 const path = require("path");
 const fs = require("fs");
 const { fal } = require("@fal-ai/client");
+const { execFile } = require("child_process");
+const { promisify } = require("util");
+
+const execFileAsync = promisify(execFile);
 
 const app = express();
 app.set("trust proxy", true);
@@ -41,6 +45,21 @@ if (process.env.FAL_KEY) {
   });
 }
 
+const MODELS = {
+  topaz: "fal-ai/topaz/upscale/video",
+  crystal: "clarityai/crystal-video-upscaler",
+  film: "fal-ai/film/video",
+  reframe: "fal-ai/luma-dream-machine/ray-2/reframe",
+};
+
+function toBool(value) {
+  return value === true || value === "true";
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 function getPublicBaseUrl(req) {
   return `${req.protocol}://${req.get("host")}`;
 }
@@ -48,24 +67,354 @@ function getPublicBaseUrl(req) {
 function buildAppliedEnhancements(options = {}) {
   const items = [];
 
-  if (options.enableUpscale === "true") items.push("Upscale");
-  if (options.enableDenoise === "true") items.push("Denoise");
-  if (options.enableSharpen === "true") items.push("Sharpen");
-  if (options.enableColorBoost === "true") items.push("Color Boost");
-  if (options.enableFrameSmoothing === "true") items.push("Frame Smoothing");
-  if (options.enableSocialExport === "true") items.push("Social Export");
+  if (toBool(options.enableUpscale)) items.push("Upscale");
+  if (toBool(options.enableDenoise)) items.push("Denoise");
+  if (toBool(options.enableSharpen)) items.push("Sharpen");
+  if (toBool(options.enableColorBoost)) items.push("Color Boost");
+  if (toBool(options.enableFrameSmoothing)) items.push("Frame Smoothing");
+  if (toBool(options.enableSocialExport)) items.push("Social Export");
+  if (toBool(options.enableReframing)) items.push("Reframing");
 
   return items;
 }
 
 function mapTargetResolution(qualityLevel) {
-  if (qualityLevel === "Ultra") return "1080p";
-  return "720p";
+  switch (qualityLevel) {
+    case "Ultra":
+      return "1080p";
+    case "High":
+      return "1080p";
+    case "Medium":
+    default:
+      return "720p";
+  }
 }
 
-function mapCreativity(options = {}) {
-  if (options.smartMode === "true") return 1;
-  return 1;
+function mapAspectRatio(exportTarget) {
+  switch (exportTarget) {
+    case "Vertical":
+      return "9:16";
+    case "Square":
+      return "1:1";
+    case "Horizontal":
+    default:
+      return "16:9";
+  }
+}
+
+function computeProgress(currentStepIndex, totalSteps, state = "running") {
+  const start = 10;
+  const end = 95;
+
+  if (totalSteps <= 0) return 100;
+
+  const perStep = (end - start) / totalSteps;
+  const base = start + currentStepIndex * perStep;
+
+  if (state === "queued") return Math.round(base);
+  if (state === "running") return Math.round(base + perStep * 0.55);
+  if (state === "done") return Math.round(base + perStep);
+
+  return Math.round(base);
+}
+
+function extractResultVideoUrl(result) {
+  return (
+    result?.data?.video?.url ||
+    result?.data?.video_url ||
+    result?.data?.output?.url ||
+    result?.video?.url ||
+    result?.video_url ||
+    result?.output?.url ||
+    null
+  );
+}
+
+function publicUrlToLocalPath(videoUrl) {
+  try {
+    const pathname = new URL(videoUrl).pathname;
+    const filename = path.basename(pathname);
+    return path.join(uploadsDir, filename);
+  } catch (error) {
+    return path.join(uploadsDir, path.basename(videoUrl));
+  }
+}
+
+function createOutputPath(prefix = "processed") {
+  return path.join(uploadsDir, `${prefix}-${Date.now()}.mp4`);
+}
+
+function buildVideoPipeline(options = {}) {
+  const steps = [];
+
+  const smartMode = toBool(options.smartMode);
+
+  const wantsDenoise = smartMode || toBool(options.enableDenoise);
+  const wantsSharpen = smartMode || toBool(options.enableSharpen);
+  const wantsUpscale = smartMode || toBool(options.enableUpscale);
+  const wantsFrameSmoothing = toBool(options.enableFrameSmoothing);
+  const wantsReframing = toBool(options.enableReframing);
+  const wantsColorBoost = smartMode || toBool(options.enableColorBoost);
+  const wantsSocialExport = smartMode || toBool(options.enableSocialExport);
+
+  // 1) تنظيف/استرجاع تفاصيل
+  if (wantsDenoise || wantsSharpen) {
+    steps.push({
+      key: "topazEnhance",
+      label: "Topaz Enhance",
+      type: "fal",
+      model: MODELS.topaz,
+      buildInput: (videoUrl, opts) => ({
+        video_url: videoUrl,
+        target_resolution: mapTargetResolution(opts.qualityLevel),
+        prompt: "",
+      }),
+    });
+  }
+
+  // 2) upscale نهائي
+  if (wantsUpscale) {
+    steps.push({
+      key: "crystalUpscale",
+      label: "Crystal Upscale",
+      type: "fal",
+      model: MODELS.crystal,
+      buildInput: (videoUrl) => ({
+        video_url: videoUrl,
+      }),
+    });
+  }
+
+  // 3) frame smoothing
+  if (wantsFrameSmoothing) {
+    steps.push({
+      key: "frameSmoothing",
+      label: "Frame Smoothing",
+      type: "fal",
+      model: MODELS.film,
+      buildInput: (videoUrl) => ({
+        video_url: videoUrl,
+        num_frames: 1,
+        use_scene_detection: true,
+        use_calculated_fps: true,
+        video_quality: "high",
+      }),
+    });
+  }
+
+  // 4) reframing
+  if (wantsReframing) {
+    steps.push({
+      key: "reframing",
+      label: "Reframing",
+      type: "fal",
+      model: MODELS.reframe,
+      buildInput: (videoUrl, opts) => ({
+        video_url: videoUrl,
+        aspect_ratio: mapAspectRatio(opts.exportTarget),
+      }),
+    });
+  }
+
+  // 5) export نهائي
+  if (
+    wantsColorBoost ||
+    wantsSocialExport ||
+    options.qualityLevel ||
+    options.exportTarget
+  ) {
+    steps.push({
+      key: "finalExport",
+      label: "Final Export",
+      type: "ffmpeg",
+    });
+  }
+
+  return steps;
+}
+
+async function runFalStep(job, step, inputVideoUrl, stepIndex) {
+  job.currentStep = step.key;
+  job.currentStepLabel = step.label;
+  job.currentModel = step.model;
+  job.progress = computeProgress(stepIndex, job.totalSteps, "queued");
+
+  const submitResult = await fal.queue.submit(step.model, {
+    input: step.buildInput(inputVideoUrl, job.options),
+  });
+
+  const requestId = submitResult.request_id;
+  job.activeRequestId = requestId;
+
+  while (true) {
+    const status = await fal.queue.status(step.model, {
+      requestId,
+      logs: true,
+    });
+
+    const falState = status.status;
+
+    if (falState === "IN_QUEUE") {
+      job.status = "processing";
+      job.progress = computeProgress(stepIndex, job.totalSteps, "queued");
+    } else if (falState === "IN_PROGRESS") {
+      job.status = "processing";
+      job.progress = computeProgress(stepIndex, job.totalSteps, "running");
+    } else if (falState === "COMPLETED") {
+      const result = await fal.queue.result(step.model, {
+        requestId,
+      });
+
+      const outputVideoUrl = extractResultVideoUrl(result);
+
+      if (!outputVideoUrl) {
+        throw new Error(
+          `Step "${step.key}" completed but no output video URL was returned`
+        );
+      }
+
+      job.completedSteps = stepIndex + 1;
+      job.progress = computeProgress(stepIndex, job.totalSteps, "done");
+      return outputVideoUrl;
+    } else if (falState === "FAILED" || falState === "CANCELLED") {
+      throw new Error(`AI step failed: ${step.key}`);
+    }
+
+    await sleep(2000);
+  }
+}
+
+function buildFfmpegArgs(inputPath, outputPath, options = {}) {
+  const filters = [];
+
+  if (toBool(options.enableColorBoost) || toBool(options.smartMode)) {
+    filters.push("eq=saturation=1.12:contrast=1.04:brightness=0.01");
+  }
+
+  const exportTarget = options.exportTarget || "Horizontal";
+
+  if (exportTarget === "Vertical") {
+    filters.push(
+      "scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2"
+    );
+  } else if (exportTarget === "Square") {
+    filters.push(
+      "scale=1080:1080:force_original_aspect_ratio=decrease,pad=1080:1080:(ow-iw)/2:(oh-ih)/2"
+    );
+  } else {
+    filters.push(
+      "scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2"
+    );
+  }
+
+  let crf = "21";
+  let preset = "medium";
+
+  if (options.qualityLevel === "Ultra") {
+    crf = "18";
+    preset = "slow";
+  } else if (options.qualityLevel === "High") {
+    crf = "20";
+    preset = "slow";
+  }
+
+  const args = ["-y", "-i", inputPath];
+
+  if (filters.length > 0) {
+    args.push("-vf", filters.join(","));
+  }
+
+  args.push(
+    "-c:v",
+    "libx264",
+    "-preset",
+    preset,
+    "-crf",
+    crf,
+    "-pix_fmt",
+    "yuv420p",
+    "-movflags",
+    "+faststart",
+    "-c:a",
+    "aac",
+    "-b:a",
+    "192k",
+    outputPath
+  );
+
+  return args;
+}
+
+async function runFfmpegStep(job, step, inputVideoUrl, stepIndex, publicBaseUrl) {
+  job.currentStep = step.key;
+  job.currentStepLabel = step.label;
+  job.currentModel = "ffmpeg";
+  job.progress = computeProgress(stepIndex, job.totalSteps, "running");
+
+  const inputPath = publicUrlToLocalPath(inputVideoUrl);
+  const outputPath = createOutputPath(step.key);
+  const args = buildFfmpegArgs(inputPath, outputPath, job.options);
+
+  await execFileAsync("ffmpeg", args);
+
+  job.completedSteps = stepIndex + 1;
+  job.progress = computeProgress(stepIndex, job.totalSteps, "done");
+
+  return `${publicBaseUrl}/uploads/${path.basename(outputPath)}`;
+}
+
+async function runPipeline(job, initialVideoUrl, publicBaseUrl) {
+  const steps = buildVideoPipeline(job.options);
+
+  job.pipeline = steps.map((step) => ({
+    key: step.key,
+    label: step.label,
+    type: step.type,
+    model: step.model || "ffmpeg",
+  }));
+
+  job.totalSteps = steps.length;
+  job.completedSteps = 0;
+  job.status = "processing";
+  job.progress = 10;
+  job.currentStep = "analyzing";
+  job.currentStepLabel = "Analyzing";
+  job.currentModel = null;
+
+  if (steps.length === 0) {
+    job.resultUrl = initialVideoUrl;
+    job.status = "done";
+    job.progress = 100;
+    job.currentStep = "done";
+    job.currentStepLabel = "Completed";
+    return;
+  }
+
+  let currentVideoUrl = initialVideoUrl;
+
+  for (let i = 0; i < steps.length; i += 1) {
+    const step = steps[i];
+
+    if (step.type === "fal") {
+      currentVideoUrl = await runFalStep(job, step, currentVideoUrl, i);
+    } else if (step.type === "ffmpeg") {
+      currentVideoUrl = await runFfmpegStep(
+        job,
+        step,
+        currentVideoUrl,
+        i,
+        publicBaseUrl
+      );
+    }
+  }
+
+  job.resultUrl = currentVideoUrl;
+  job.status = "done";
+  job.progress = 100;
+  job.currentStep = "done";
+  job.currentStepLabel = "Completed";
+  job.currentModel = null;
+  job.activeRequestId = null;
 }
 
 app.get("/", (req, res) => {
@@ -109,25 +458,30 @@ app.post("/enhance", upload.single("video"), async (req, res) => {
       resultUrl: null,
       options,
       appliedEnhancements,
-      status: "processing",
+      status: "queued",
       progress: 5,
       createdAt: Date.now(),
-      falRequestId: null,
-      falModel: "fal-ai/topaz/upscale/video",
+      activeRequestId: null,
+      currentStep: "queued",
+      currentStepLabel: "Queued",
+      currentModel: null,
+      pipeline: [],
+      totalSteps: 0,
+      completedSteps: 0,
       error: null,
     };
 
-    const submitResult = await fal.queue.submit("fal-ai/topaz/upscale/video", {
-      input: {
-        video_url: publicVideoUrl,
-        target_resolution: mapTargetResolution(options.qualityLevel),
-        creativity: mapCreativity(options),
-        prompt: "",
-      },
-    });
+    runPipeline(jobs[jobId], publicVideoUrl, publicBaseUrl).catch((error) => {
+      console.error("Pipeline error:", error);
 
-    jobs[jobId].falRequestId = submitResult.request_id;
-    jobs[jobId].progress = 15;
+      jobs[jobId].status = "failed";
+      jobs[jobId].progress = 100;
+      jobs[jobId].error = error.message;
+      jobs[jobId].currentStep = "failed";
+      jobs[jobId].currentStepLabel = "Failed";
+      jobs[jobId].currentModel = null;
+      jobs[jobId].activeRequestId = null;
+    });
 
     return res.json({
       success: true,
@@ -135,13 +489,14 @@ app.post("/enhance", upload.single("video"), async (req, res) => {
       jobId,
       fileName: req.file.originalname,
       options,
+      appliedEnhancements,
     });
   } catch (error) {
     console.error("Enhance error:", error);
 
     return res.status(500).json({
       success: false,
-      error: "Server error while submitting AI job",
+      error: "Server error while creating processing job",
       details: error.message,
     });
   }
@@ -159,54 +514,19 @@ app.get("/status/:jobId", async (req, res) => {
       });
     }
 
-    if (!job.falRequestId) {
-      return res.json({
-        success: true,
-        jobId: job.id,
-        fileName: job.fileName,
-        status: job.status,
-        progress: job.progress,
-      });
-    }
-
-    if (job.status === "done" || job.status === "failed") {
-      return res.json({
-        success: true,
-        jobId: job.id,
-        fileName: job.fileName,
-        status: job.status,
-        progress: job.progress,
-      });
-    }
-
-    const falStatus = await fal.queue.status(job.falModel, {
-      requestId: job.falRequestId,
-      logs: true,
-    });
-
-    const falState = falStatus.status;
-
-    if (falState === "IN_QUEUE") {
-      job.status = "processing";
-      job.progress = 20;
-    } else if (falState === "IN_PROGRESS") {
-      job.status = "processing";
-      job.progress = 70;
-    } else if (falState === "COMPLETED") {
-      job.status = "done";
-      job.progress = 100;
-    } else if (falState === "FAILED" || falState === "CANCELLED") {
-      job.status = "failed";
-      job.progress = 100;
-      job.error = "AI processing failed";
-    }
-
     return res.json({
       success: true,
       jobId: job.id,
       fileName: job.fileName,
       status: job.status,
       progress: job.progress,
+      currentStep: job.currentStep,
+      currentStepLabel: job.currentStepLabel,
+      currentModel: job.currentModel,
+      totalSteps: job.totalSteps,
+      completedSteps: job.completedSteps,
+      pipeline: job.pipeline,
+      error: job.error,
     });
   } catch (error) {
     console.error("Status error:", error);
@@ -238,56 +558,24 @@ app.get("/result/:jobId", async (req, res) => {
       });
     }
 
-    if (!job.falRequestId) {
+    if (job.status !== "done") {
       return res.status(400).json({
         success: false,
-        error: "AI request not created yet",
+        error: "Processing not finished yet",
       });
     }
-
-    if (job.status !== "done") {
-      const falStatus = await fal.queue.status(job.falModel, {
-        requestId: job.falRequestId,
-        logs: false,
-      });
-
-      if (falStatus.status !== "COMPLETED") {
-        return res.status(400).json({
-          success: false,
-          error: "Processing not finished yet",
-        });
-      }
-
-      job.status = "done";
-      job.progress = 100;
-    }
-
-    let resultUrl = job.resultUrl;
-
-    try {
-      const result = await fal.queue.result(job.falModel, {
-        requestId: job.falRequestId,
-      });
-
-      resultUrl = result?.data?.video?.url || null;
-    } catch (error) {
-      console.error("fal queue.result failed:", error);
-      resultUrl = job.originalUrl;
-    }
-
-    if (!resultUrl) {
-      resultUrl = job.originalUrl;
-    }
-
-    job.resultUrl = resultUrl;
 
     return res.json({
       success: true,
       jobId: job.id,
       fileName: job.fileName,
       status: job.status,
-      resultUrl: job.resultUrl,
+      resultUrl: job.resultUrl || job.originalUrl,
+      originalUrl: job.originalUrl,
       appliedEnhancements: job.appliedEnhancements,
+      pipeline: job.pipeline,
+      exportTarget: job.options?.exportTarget || "Horizontal",
+      qualityLevel: job.options?.qualityLevel || "Medium",
     });
   } catch (error) {
     console.error("Result error:", error);
