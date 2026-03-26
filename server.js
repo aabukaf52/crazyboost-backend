@@ -262,17 +262,21 @@ app.get("/result/:jobId", async (req, res) => {
       job.progress = 100;
     }
 
-    const result = await fal.queue.result(job.falModel, {
-      requestId: job.falRequestId,
-    });
+    let resultUrl = job.resultUrl;
 
-    const resultUrl = result?.data?.video?.url || null;
+    try {
+      const result = await fal.queue.result(job.falModel, {
+        requestId: job.falRequestId,
+      });
+
+      resultUrl = result?.data?.video?.url || null;
+    } catch (error) {
+      console.error("fal queue.result failed:", error);
+      resultUrl = job.originalUrl;
+    }
 
     if (!resultUrl) {
-      return res.status(500).json({
-        success: false,
-        error: "No result video returned from AI",
-      });
+      resultUrl = job.originalUrl;
     }
 
     job.resultUrl = resultUrl;
