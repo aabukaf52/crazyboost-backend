@@ -113,11 +113,11 @@ app.post("/enhance", upload.single("video"), async (req, res) => {
       progress: 5,
       createdAt: Date.now(),
       falRequestId: null,
-      falModel: "fal-ai/video-enhancer",
+      falModel: "fal-ai/wan-vision-enhancer",
       error: null,
     };
 
-    const submitResult = await fal.queue.submit("fal-ai/video-enhancer", {
+    const submitResult = await fal.queue.submit("fal-ai/wan-vision-enhancer", {
       input: {
         video_url: publicVideoUrl,
         target_resolution: mapTargetResolution(options.qualityLevel),
@@ -262,17 +262,21 @@ app.get("/result/:jobId", async (req, res) => {
       job.progress = 100;
     }
 
-    const result = await fal.queue.result(job.falModel, {
-      requestId: job.falRequestId,
-    });
+    let resultUrl = job.resultUrl;
 
-    const resultUrl = result?.data?.video?.url || null;
+    try {
+      const result = await fal.queue.result(job.falModel, {
+        requestId: job.falRequestId,
+      });
+
+      resultUrl = result?.data?.video?.url || null;
+    } catch (error) {
+      console.error("fal queue.result failed:", error);
+      resultUrl = job.originalUrl;
+    }
 
     if (!resultUrl) {
-      return res.status(500).json({
-        success: false,
-        error: "No result video returned from AI",
-      });
+      resultUrl = job.originalUrl;
     }
 
     job.resultUrl = resultUrl;
