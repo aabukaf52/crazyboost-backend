@@ -61,6 +61,10 @@ function sleep(ms) {
 }
 
 function getPublicBaseUrl(req) {
+  if (process.env.RENDER_EXTERNAL_URL) {
+    return process.env.RENDER_EXTERNAL_URL;
+  }
+
   return `${req.protocol}://${req.get("host")}`;
 }
 
@@ -78,18 +82,6 @@ function buildAppliedEnhancements(options = {}) {
   return items;
 }
 
-function mapTargetResolution(qualityLevel) {
-  switch (qualityLevel) {
-    case "Ultra":
-      return "1080p";
-    case "High":
-      return "1080p";
-    case "Medium":
-    default:
-      return "720p";
-  }
-}
-
 function mapAspectRatio(exportTarget) {
   switch (exportTarget) {
     case "Vertical":
@@ -99,6 +91,18 @@ function mapAspectRatio(exportTarget) {
     case "Horizontal":
     default:
       return "16:9";
+  }
+}
+
+function mapUpscaleFactor(qualityLevel) {
+  switch (qualityLevel) {
+    case "Ultra":
+      return 4;
+    case "High":
+      return 2;
+    case "Medium":
+    default:
+      return 2;
   }
 }
 
@@ -130,14 +134,66 @@ function extractResultVideoUrl(result) {
   );
 }
 
-function publicUrlToLocalPath(videoUrl) {
+function getLocalUploadedPathFromUrl(videoUrl) {
   try {
-    const pathname = new URL(videoUrl).pathname;
-    const filename = path.basename(pathname);
-    return path.join(uploadsDir, filename);
+    const parsed = new URL(videoUrl);
+    const maybeFileName = path.basename(parsed.pathname);
+    const fullPath = path.join(uploadsDir, maybeFileName);
+
+    if (fs.existsSync(fullPath)) {
+      return fullPath;
+    }
+
+    return null;
   } catch (error) {
-    return path.join(uploadsDir, path.basename(videoUrl));
+    const maybeFileName = path.basename(videoUrl);
+    const fullPath = path.join(uploadsDir, maybeFileName);
+
+    if (fs.existsSync(fullPath)) {
+      return fullPath;
+    }
+
+    return null;
   }
+}
+
+async function downloadRemoteVideoToLocal(videoUrl) {
+  const response = await fetch(videoUrl);
+
+  if (!response.ok) {
+    throw new Error(`Failed to download remote video: ${response.status}`);
+  }
+
+  const buffer = Buffer.from(await response.arrayBuffer());
+  const ext =
+    path.extname(new URL(videoUrl).pathname).split("?")[0] ||
+    ".mp4";
+
+  const localPath = path.join(
+    uploadsDir,
+    `remote-${Date.now()}-${Math.round(Math.random() * 1e9)}${ext || ".mp4"}`
+  );
+
+  fs.writeFileSync(localPath, buffer);
+  return localPath;
+}
+
+async function resolveVideoUrlToLocalPath(videoUrl) {
+  const existingLocalPath = getLocalUploadedPathFromUrl(videoUrl);
+
+  if (existingLocalPath) {
+    return {
+      inputPath: existingLocalPath,
+      isTemp: false,
+    };
+  }
+
+  const downloadedPath = await downloadRemoteVideoToLocal(videoUrl);
+
+  return {
+    inputPath: downloadedPath,
+    isTemp: true,
+  };
 }
 
 function createOutputPath(prefix = "processed") {
@@ -157,7 +213,6 @@ function buildVideoPipeline(options = {}) {
   const wantsColorBoost = smartMode || toBool(options.enableColorBoost);
   const wantsSocialExport = smartMode || toBool(options.enableSocialExport);
 
-  // 1) تنظيف/استرجاع تفاصيل
   if (wantsDenoise || wantsSharpen) {
     steps.push({
       key: "topazEnhance",
@@ -166,26 +221,29 @@ function buildVideoPipeline(options = {}) {
       model: MODELS.topaz,
       buildInput: (videoUrl, opts) => ({
         video_url: videoUrl,
-        target_resolution: mapTargetResolution(opts.qualityLevel),
-        prompt: "",
+        model: wantsDenoise ? "Artemis HQ" : "Proteus",
+        upscale_factor: mapUpscaleFactor(opts.qualityLevel),
+        noise: wantsDenoise ? 0.35 : 0.1,
+        recover_detail: wantsSharpen ? 0.3 : 0.15,
+        compression: 0.2,
+        halo: 0.05,
       }),
     });
   }
 
-  // 2) upscale نهائي
   if (wantsUpscale) {
     steps.push({
       key: "crystalUpscale",
       label: "Crystal Upscale",
       type: "fal",
       model: MODELS.crystal,
-      buildInput: (videoUrl) => ({
+      buildInput: (videoUrl, opts) => ({
         video_url: videoUrl,
+        scale_factor: mapUpscaleFactor(opts.qualityLevel),
       }),
     });
   }
 
-  // 3) frame smoothing
   if (wantsFrameSmoothing) {
     steps.push({
       key: "frameSmoothing",
@@ -197,12 +255,10 @@ function buildVideoPipeline(options = {}) {
         num_frames: 1,
         use_scene_detection: true,
         use_calculated_fps: true,
-        video_quality: "high",
       }),
     });
   }
 
-  // 4) reframing
   if (wantsReframing) {
     steps.push({
       key: "reframing",
@@ -216,7 +272,6 @@ function buildVideoPipeline(options = {}) {
     });
   }
 
-  // 5) export نهائي
   if (
     wantsColorBoost ||
     wantsSocialExport ||
@@ -351,11 +406,19 @@ async function runFfmpegStep(job, step, inputVideoUrl, stepIndex, publicBaseUrl)
   job.currentModel = "ffmpeg";
   job.progress = computeProgress(stepIndex, job.totalSteps, "running");
 
-  const inputPath = publicUrlToLocalPath(inputVideoUrl);
+  const resolved = await resolveVideoUrlToLocalPath(inputVideoUrl);
   const outputPath = createOutputPath(step.key);
-  const args = buildFfmpegArgs(inputPath, outputPath, job.options);
+  const args = buildFfmpegArgs(resolved.inputPath, outputPath, job.options);
 
-  await execFileAsync("ffmpeg", args);
+  try {
+    const ffmpegPath = require("ffmpeg-static");
+
+await execFileAsync(ffmpegPath, args);
+  } finally {
+    if (resolved.isTemp && fs.existsSync(resolved.inputPath)) {
+      fs.unlinkSync(resolved.inputPath);
+    }
+  }
 
   job.completedSteps = stepIndex + 1;
   job.progress = computeProgress(stepIndex, job.totalSteps, "done");
@@ -419,6 +482,10 @@ async function runPipeline(job, initialVideoUrl, publicBaseUrl) {
 
 app.get("/", (req, res) => {
   res.json({ message: "CrazyBoost backend is running" });
+});
+
+app.get("/health", (req, res) => {
+  res.status(200).json({ ok: true });
 });
 
 app.post("/enhance", upload.single("video"), async (req, res) => {
@@ -589,7 +656,8 @@ app.get("/result/:jobId", async (req, res) => {
 });
 
 const PORT = process.env.PORT || 5000;
+const HOST = "0.0.0.0";
 
-app.listen(PORT, () => {
+app.listen(PORT, HOST, () => {
   console.log(`🚀 Server running on port ${PORT}`);
 });
