@@ -18,6 +18,14 @@ if (!process.env.REDIS_URL) {
   throw new Error("REDIS_URL is missing. Put it in your .env file.");
 }
 
+if (
+  !process.env.CLOUDINARY_CLOUD_NAME ||
+  !process.env.CLOUDINARY_API_KEY ||
+  !process.env.CLOUDINARY_API_SECRET
+) {
+  throw new Error("Cloudinary environment variables are missing.");
+}
+
 cloudinary.config({
   cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
   api_key: process.env.CLOUDINARY_API_KEY,
@@ -33,7 +41,6 @@ const videoQueue = new Queue("video-processing", {
   connection: redis,
 });
 
-// نستخدم memoryStorage حتى ما نخزن ملفات محليًا على السيرفر
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: {
@@ -41,7 +48,11 @@ const upload = multer({
   },
 });
 
-app.use(cors());
+app.use(
+  cors({
+    origin: "*",
+  })
+);
 app.use(express.json({ limit: "10mb" }));
 app.use(express.urlencoded({ extended: true }));
 
@@ -73,28 +84,29 @@ function makeJobId() {
 function buildAppliedEnhancements(options = {}) {
   const items = [];
   const processingMode = normalizeString(options.processingMode).toLowerCase();
+  const smartMode = toBool(options.smartMode);
 
-  if (toBool(options.enableUpscale) || processingMode === "smart") {
+  if (smartMode || toBool(options.enableUpscale)) {
     items.push("Upscale");
   }
 
-  if (toBool(options.enableDenoise) || processingMode === "smart") {
+  if (smartMode || toBool(options.enableDenoise)) {
     items.push("Denoise");
   }
 
-  if (toBool(options.enableSharpen) || processingMode === "smart") {
+  if (smartMode || toBool(options.enableSharpen)) {
     items.push("Sharpen");
   }
 
-  if (toBool(options.enableColorBoost) || toBool(options.smartMode)) {
+  if (smartMode || toBool(options.enableColorBoost)) {
     items.push("Color Boost");
   }
 
-  if (toBool(options.enableFrameSmoothing)) {
+  if (smartMode || toBool(options.enableFrameSmoothing)) {
     items.push("Frame Smoothing");
   }
 
-  if (toBool(options.enableSocialExport) || toBool(options.smartMode)) {
+  if (smartMode || toBool(options.enableSocialExport)) {
     items.push("Social Export");
   }
 
@@ -116,7 +128,10 @@ function buildAppliedEnhancements(options = {}) {
 function buildPipeline(options = {}) {
   const steps = [];
   const smartMode = toBool(options.smartMode);
-  const processingMode = normalizeString(options.processingMode, "").toLowerCase();
+  const processingMode = normalizeString(
+    options.processingMode,
+    ""
+  ).toLowerCase();
 
   const wantsAnyProcessing =
     smartMode ||
@@ -237,6 +252,7 @@ app.post("/enhance", upload.single("video"), async (req, res) => {
   try {
     const options = req.body || {};
     const providedVideoUrl = normalizeString(req.body?.videoUrl);
+
     let originalUrl = providedVideoUrl;
     let originalFileName = "video.mp4";
     let storedFileName = `remote-source-${Date.now()}.mp4`;
@@ -259,10 +275,6 @@ app.post("/enhance", upload.single("video"), async (req, res) => {
       });
     }
 
-    if (req.file && !originalFileName) {
-      originalFileName = req.file.originalname || "video.mp4";
-    }
-
     if (!req.file && providedVideoUrl) {
       const cleanUrl = providedVideoUrl.split("?")[0];
       const guessedName = cleanUrl.split("/").pop();
@@ -273,9 +285,6 @@ app.post("/enhance", upload.single("video"), async (req, res) => {
     }
 
     const jobId = makeJobId();
-    const appliedEnhancements = buildAppliedEnhancements(options);
-    const pipeline = buildPipeline(options);
-
     const normalizedOptions = {
       smartMode: options.smartMode,
       processingMode: normalizeString(options.processingMode),
@@ -288,6 +297,9 @@ app.post("/enhance", upload.single("video"), async (req, res) => {
       exportTarget: normalizeString(options.exportTarget, "Horizontal"),
       qualityLevel: normalizeString(options.qualityLevel, "High"),
     };
+
+    const appliedEnhancements = buildAppliedEnhancements(normalizedOptions);
+    const pipeline = buildPipeline(normalizedOptions);
 
     const jobData = {
       id: jobId,
