@@ -3,6 +3,7 @@ const cors = require("cors");
 const multer = require("multer");
 const path = require("path");
 const fs = require("fs");
+const fsp = require("fs/promises");
 const { execFile } = require("child_process");
 const { promisify } = require("util");
 const ffmpegPath = require("ffmpeg-static");
@@ -13,9 +14,14 @@ const app = express();
 app.set("trust proxy", true);
 
 const uploadsDir = path.join(__dirname, "uploads");
+const jobsFilePath = path.join(__dirname, "jobs.json");
 
 if (!fs.existsSync(uploadsDir)) {
   fs.mkdirSync(uploadsDir, { recursive: true });
+}
+
+if (!fs.existsSync(jobsFilePath)) {
+  fs.writeFileSync(jobsFilePath, JSON.stringify({}, null, 2), "utf8");
 }
 
 const storage = multer.diskStorage({
@@ -37,10 +43,54 @@ app.use(cors());
 app.use(express.json());
 app.use("/uploads", express.static(uploadsDir));
 
-const jobs = {};
+let jobs = loadJobsFromDisk();
+
+/* =========================
+   Helpers
+========================= */
+
+function loadJobsFromDisk() {
+  try {
+    const raw = fs.readFileSync(jobsFilePath, "utf8");
+    const parsed = JSON.parse(raw || "{}");
+    return parsed && typeof parsed === "object" ? parsed : {};
+  } catch (error) {
+    console.error("Failed to load jobs from disk:", error);
+    return {};
+  }
+}
+
+async function saveJobsToDisk() {
+  try {
+    await fsp.writeFile(jobsFilePath, JSON.stringify(jobs, null, 2), "utf8");
+  } catch (error) {
+    console.error("Failed to save jobs to disk:", error);
+  }
+}
+
+async function updateJob(jobId, updates) {
+  if (!jobs[jobId]) return;
+  jobs[jobId] = {
+    ...jobs[jobId],
+    ...updates,
+    updatedAt: Date.now(),
+  };
+  await saveJobsToDisk();
+}
 
 function toBool(value) {
-  return value === true || value === "true";
+  if (typeof value === "boolean") return value;
+  if (typeof value === "string") {
+    const normalized = value.trim().toLowerCase();
+    return normalized === "true" || normalized === "1" || normalized === "yes";
+  }
+  if (typeof value === "number") return value === 1;
+  return false;
+}
+
+function normalizeString(value, fallback = "") {
+  if (value == null) return fallback;
+  return String(value).trim() || fallback;
 }
 
 function getPublicBaseUrl(req) {
@@ -56,6 +106,10 @@ function buildAppliedEnhancements(options = {}) {
 
   if (toBool(options.enableColorBoost) || toBool(options.smartMode)) {
     items.push("Color Boost");
+  }
+
+  if (toBool(options.enableSocialExport) || toBool(options.smartMode)) {
+    items.push("Social Export");
   }
 
   if (options.exportTarget) {
@@ -80,7 +134,7 @@ function getLocalUploadedPathFromUrl(videoUrl) {
     }
 
     return null;
-  } catch (error) {
+  } catch (_) {
     const maybeFileName = path.basename(videoUrl);
     const fullPath = path.join(uploadsDir, maybeFileName);
 
@@ -93,6 +147,8 @@ function getLocalUploadedPathFromUrl(videoUrl) {
 }
 
 async function downloadRemoteVideoToLocal(videoUrl) {
+  console.log("Downloading remote video:", videoUrl);
+
   const response = await fetch(videoUrl);
 
   if (!response.ok) {
@@ -114,6 +170,8 @@ async function downloadRemoteVideoToLocal(videoUrl) {
   );
 
   fs.writeFileSync(localPath, buffer);
+  console.log("Remote video downloaded to:", localPath);
+
   return localPath;
 }
 
@@ -136,7 +194,10 @@ async function resolveVideoUrlToLocalPath(videoUrl) {
 }
 
 function createOutputPath(prefix = "processed") {
-  return path.join(uploadsDir, `${prefix}-${Date.now()}.mp4`);
+  return path.join(
+    uploadsDir,
+    `${prefix}-${Date.now()}-${Math.round(Math.random() * 1e9)}.mp4`
+  );
 }
 
 function computeProgress(currentStepIndex, totalSteps, state = "running") {
@@ -161,12 +222,22 @@ function buildVideoPipeline(options = {}) {
 
   const wantsColorBoost = smartMode || toBool(options.enableColorBoost);
   const wantsSocialExport = smartMode || toBool(options.enableSocialExport);
+  const hasQualityLevel = Boolean(normalizeString(options.qualityLevel));
+  const hasExportTarget = Boolean(normalizeString(options.exportTarget));
+
+  console.log("Pipeline decision:", {
+    smartMode,
+    wantsColorBoost,
+    wantsSocialExport,
+    qualityLevel: options.qualityLevel,
+    exportTarget: options.exportTarget,
+  });
 
   if (
     wantsColorBoost ||
     wantsSocialExport ||
-    options.qualityLevel ||
-    options.exportTarget
+    hasQualityLevel ||
+    hasExportTarget
   ) {
     steps.push({
       key: "finalExport",
@@ -174,6 +245,8 @@ function buildVideoPipeline(options = {}) {
       type: "ffmpeg",
     });
   }
+
+  console.log("Built pipeline steps:", steps);
 
   return steps;
 }
@@ -185,7 +258,8 @@ function buildFfmpegArgs(inputPath, outputPath, options = {}) {
     filters.push("eq=saturation=1.12:contrast=1.04:brightness=0.01");
   }
 
-  const exportTarget = options.exportTarget || "Horizontal";
+  const exportTarget = normalizeString(options.exportTarget, "Horizontal");
+  const qualityLevel = normalizeString(options.qualityLevel, "Medium");
 
   if (exportTarget === "Vertical") {
     filters.push(
@@ -204,10 +278,10 @@ function buildFfmpegArgs(inputPath, outputPath, options = {}) {
   let crf = "21";
   let preset = "medium";
 
-  if (options.qualityLevel === "Ultra") {
+  if (qualityLevel === "Ultra") {
     crf = "18";
     preset = "slow";
-  } else if (options.qualityLevel === "High") {
+  } else if (qualityLevel === "High") {
     crf = "20";
     preset = "slow";
   }
@@ -239,54 +313,91 @@ function buildFfmpegArgs(inputPath, outputPath, options = {}) {
   return args;
 }
 
-async function runFfmpegStep(job, step, inputVideoUrl, stepIndex, publicBaseUrl) {
-  job.currentStep = step.key;
-  job.currentStepLabel = step.label;
-  job.currentModel = "ffmpeg";
-  job.progress = computeProgress(stepIndex, job.totalSteps, "running");
+async function runFfmpegStep(jobId, step, inputVideoUrl, stepIndex, publicBaseUrl) {
+  const job = jobs[jobId];
+  if (!job) {
+    throw new Error(`Job ${jobId} not found before FFmpeg step`);
+  }
+
+  await updateJob(jobId, {
+    currentStep: step.key,
+    currentStepLabel: step.label,
+    currentModel: "ffmpeg",
+    progress: computeProgress(stepIndex, job.totalSteps, "running"),
+    status: "processing",
+  });
+
+  console.log(`[Job ${jobId}] Starting ffmpeg step`);
 
   const resolved = await resolveVideoUrlToLocalPath(inputVideoUrl);
   const outputPath = createOutputPath(step.key);
   const args = buildFfmpegArgs(resolved.inputPath, outputPath, job.options);
 
+  console.log(`[Job ${jobId}] FFmpeg input:`, resolved.inputPath);
+  console.log(`[Job ${jobId}] FFmpeg output:`, outputPath);
+  console.log(`[Job ${jobId}] FFmpeg args:`, args.join(" "));
+
   try {
-    await execFileAsync(ffmpegPath, args);
+    const result = await execFileAsync(ffmpegPath, args);
+    if (result?.stdout) {
+      console.log(`[Job ${jobId}] FFmpeg stdout:`, result.stdout);
+    }
+    if (result?.stderr) {
+      console.log(`[Job ${jobId}] FFmpeg stderr:`, result.stderr);
+    }
   } finally {
     if (resolved.isTemp && fs.existsSync(resolved.inputPath)) {
       fs.unlinkSync(resolved.inputPath);
     }
   }
 
-  job.completedSteps = stepIndex + 1;
-  job.progress = computeProgress(stepIndex, job.totalSteps, "done");
+  await updateJob(jobId, {
+    completedSteps: stepIndex + 1,
+    progress: computeProgress(stepIndex, job.totalSteps, "done"),
+  });
 
-  return `${publicBaseUrl}/uploads/${path.basename(outputPath)}`;
+  const outputUrl = `${publicBaseUrl}/uploads/${path.basename(outputPath)}`;
+  console.log(`[Job ${jobId}] FFmpeg finished. Output URL:`, outputUrl);
+
+  return outputUrl;
 }
 
-async function runPipeline(job, initialVideoUrl, publicBaseUrl) {
+async function runPipeline(jobId, initialVideoUrl, publicBaseUrl) {
+  const job = jobs[jobId];
+  if (!job) {
+    throw new Error(`Job ${jobId} not found before pipeline start`);
+  }
+
+  console.log(`[Job ${jobId}] Pipeline starting`);
+
   const steps = buildVideoPipeline(job.options);
 
-  job.pipeline = steps.map((step) => ({
-    key: step.key,
-    label: step.label,
-    type: step.type,
-    model: null,
-  }));
-
-  job.totalSteps = steps.length;
-  job.completedSteps = 0;
-  job.status = "processing";
-  job.progress = 10;
-  job.currentStep = "analyzing";
-  job.currentStepLabel = "Analyzing";
-  job.currentModel = null;
+  await updateJob(jobId, {
+    pipeline: steps.map((step) => ({
+      key: step.key,
+      label: step.label,
+      type: step.type,
+      model: null,
+    })),
+    totalSteps: steps.length,
+    completedSteps: 0,
+    status: "processing",
+    progress: 10,
+    currentStep: "analyzing",
+    currentStepLabel: "Analyzing",
+    currentModel: null,
+  });
 
   if (steps.length === 0) {
-    job.resultUrl = initialVideoUrl;
-    job.status = "done";
-    job.progress = 100;
-    job.currentStep = "done";
-    job.currentStepLabel = "Completed";
+    console.log(`[Job ${jobId}] No processing steps. Returning original video.`);
+    await updateJob(jobId, {
+      resultUrl: initialVideoUrl,
+      status: "done",
+      progress: 100,
+      currentStep: "done",
+      currentStepLabel: "Completed",
+      currentModel: null,
+    });
     return;
   }
 
@@ -297,7 +408,7 @@ async function runPipeline(job, initialVideoUrl, publicBaseUrl) {
 
     if (step.type === "ffmpeg") {
       currentVideoUrl = await runFfmpegStep(
-        job,
+        jobId,
         step,
         currentVideoUrl,
         i,
@@ -306,13 +417,43 @@ async function runPipeline(job, initialVideoUrl, publicBaseUrl) {
     }
   }
 
-  job.resultUrl = currentVideoUrl;
-  job.status = "done";
-  job.progress = 100;
-  job.currentStep = "done";
-  job.currentStepLabel = "Completed";
-  job.currentModel = null;
+  await updateJob(jobId, {
+    resultUrl: currentVideoUrl,
+    status: "done",
+    progress: 100,
+    currentStep: "done",
+    currentStepLabel: "Completed",
+    currentModel: null,
+  });
+
+  console.log(`[Job ${jobId}] Pipeline completed successfully`);
 }
+
+function cleanupOldJobs() {
+  const now = Date.now();
+  const maxAgeMs = 24 * 60 * 60 * 1000; // 24 hours
+  let changed = false;
+
+  for (const [jobId, job] of Object.entries(jobs)) {
+    const createdAt = job.createdAt || 0;
+    if (now - createdAt > maxAgeMs) {
+      delete jobs[jobId];
+      changed = true;
+    }
+  }
+
+  if (changed) {
+    saveJobsToDisk().catch((error) => {
+      console.error("Failed to save cleaned jobs:", error);
+    });
+  }
+}
+
+setInterval(cleanupOldJobs, 30 * 60 * 1000);
+
+/* =========================
+   Routes
+========================= */
 
 app.get("/", (req, res) => {
   res.json({ message: "CrazyBoost backend is running (No AI Version)" });
@@ -334,15 +475,16 @@ app.post("/enhance", upload.single("video"), async (req, res) => {
     const jobId = Date.now().toString();
     const publicBaseUrl = getPublicBaseUrl(req);
     const publicVideoUrl = `${publicBaseUrl}/uploads/${req.file.filename}`;
-
     const options = req.body || {};
     const appliedEnhancements = buildAppliedEnhancements(options);
 
-    console.log("Video received:", req.file.originalname);
-    console.log("Stored as:", req.file.filename);
-    console.log("Public video URL:", publicVideoUrl);
-    console.log("Options:", options);
-    console.log("Job created:", jobId);
+    console.log("========================================");
+    console.log(`[Job ${jobId}] Video received:`, req.file.originalname);
+    console.log(`[Job ${jobId}] Stored as:`, req.file.filename);
+    console.log(`[Job ${jobId}] Public video URL:`, publicVideoUrl);
+    console.log(`[Job ${jobId}] Options:`, options);
+    console.log(`[Job ${jobId}] Applied enhancements:`, appliedEnhancements);
+    console.log("========================================");
 
     jobs[jobId] = {
       id: jobId,
@@ -355,6 +497,7 @@ app.post("/enhance", upload.single("video"), async (req, res) => {
       status: "queued",
       progress: 5,
       createdAt: Date.now(),
+      updatedAt: Date.now(),
       activeRequestId: null,
       currentStep: "queued",
       currentStepLabel: "Queued",
@@ -365,16 +508,20 @@ app.post("/enhance", upload.single("video"), async (req, res) => {
       error: null,
     };
 
-    runPipeline(jobs[jobId], publicVideoUrl, publicBaseUrl).catch((error) => {
-      console.error("Pipeline error:", error);
+    await saveJobsToDisk();
 
-      jobs[jobId].status = "failed";
-      jobs[jobId].progress = 100;
-      jobs[jobId].error = error.message;
-      jobs[jobId].currentStep = "failed";
-      jobs[jobId].currentStepLabel = "Failed";
-      jobs[jobId].currentModel = null;
-      jobs[jobId].activeRequestId = null;
+    runPipeline(jobId, publicVideoUrl, publicBaseUrl).catch(async (error) => {
+      console.error(`[Job ${jobId}] Pipeline error:`, error);
+
+      await updateJob(jobId, {
+        status: "failed",
+        progress: 100,
+        error: error.message,
+        currentStep: "failed",
+        currentStepLabel: "Failed",
+        currentModel: null,
+        activeRequestId: null,
+      });
     });
 
     return res.json({
@@ -420,6 +567,8 @@ app.get("/status/:jobId", async (req, res) => {
       totalSteps: job.totalSteps,
       completedSteps: job.completedSteps,
       pipeline: job.pipeline,
+      resultUrl: job.resultUrl,
+      originalUrl: job.originalUrl,
       error: job.error,
     });
   } catch (error) {
