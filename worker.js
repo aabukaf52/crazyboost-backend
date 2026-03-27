@@ -8,6 +8,15 @@ const { execFile } = require("child_process");
 const { promisify } = require("util");
 const ffmpegPath = require("ffmpeg-static");
 
+// 🔥 Cloudinary
+const { v2: cloudinary } = require("cloudinary");
+
+cloudinary.config({
+  cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+  api_key: process.env.CLOUDINARY_API_KEY,
+  api_secret: process.env.CLOUDINARY_API_SECRET,
+});
+
 const execFileAsync = promisify(execFile);
 
 if (!process.env.REDIS_URL) {
@@ -26,6 +35,28 @@ const redis = new IORedis(process.env.REDIS_URL, {
 
 const uploadsDir = path.join(__dirname, "uploads");
 
+if (!fs.existsSync(uploadsDir)) {
+  fs.mkdirSync(uploadsDir, { recursive: true });
+}
+
+// ============================
+// 🔥 Cloudinary Upload Result
+// ============================
+async function uploadProcessedVideo(filePath, jobId, mode) {
+  const publicId = `crazyboost/results/${jobId}-${mode}-${Date.now()}`;
+
+  const result = await cloudinary.uploader.upload(filePath, {
+    resource_type: "video",
+    public_id: publicId,
+    overwrite: true,
+  });
+
+  return result.secure_url;
+}
+
+// ============================
+// 🔧 Helpers (بدون تغيير)
+// ============================
 function toBool(value) {
   if (typeof value === "boolean") return value;
   if (typeof value === "string") {
@@ -58,9 +89,7 @@ async function saveJob(job) {
 
 async function updateJob(jobId, updates) {
   const existing = await getJob(jobId);
-  if (!existing) {
-    throw new Error(`Job ${jobId} not found in Redis`);
-  }
+  if (!existing) throw new Error(`Job ${jobId} not found`);
 
   const updated = {
     ...existing,
@@ -72,280 +101,187 @@ async function updateJob(jobId, updates) {
   return updated;
 }
 
-function getProcessingMode(options = {}) {
-  const mode = normalizeString(options.processingMode, "");
-  if (mode) return mode.toLowerCase();
+// ============================
+// 🔥 تحميل الفيديو من Cloudinary
+// ============================
+async function downloadFile(url, outputPath) {
+  const response = await fetch(url);
 
-  // افتراضيًا الآن كل شيء non-ai
-  return "non-ai";
+  if (!response.ok) {
+    throw new Error(`Download failed: ${response.status}`);
+  }
+
+  const buffer = Buffer.from(await response.arrayBuffer());
+  fs.writeFileSync(outputPath, buffer);
 }
 
-function buildNonAiFfmpegArgs(inputPath, outputPath, options = {}) {
-  const filters = [];
+async function resolveInputPath(job) {
+  const localPath = path.join(uploadsDir, job.storedFileName);
 
-  const smartMode = toBool(options.smartMode);
-
-  const enableUpscale = smartMode || toBool(options.enableUpscale);
-  const enableDenoise = smartMode || toBool(options.enableDenoise);
-  const enableSharpen = smartMode || toBool(options.enableSharpen);
-  const enableColorBoost = smartMode || toBool(options.enableColorBoost);
-  const enableFrameSmoothing = toBool(options.enableFrameSmoothing);
-  const enableSocialExport = smartMode || toBool(options.enableSocialExport);
-
-  const exportTarget = normalizeString(options.exportTarget, "Horizontal");
-  const qualityLevel = normalizeString(options.qualityLevel, "High");
-
-  // 1) Denoise
-  if (enableDenoise) {
-    filters.push("hqdn3d=1.5:1.5:6:6");
+  if (fs.existsSync(localPath)) {
+    return { inputPath: localPath, isTemp: false };
   }
 
-  // 2) Upscale / Resize بجودة عالية
-  if (enableUpscale) {
-    if (exportTarget === "Vertical") {
-      filters.push(
-        "scale=1440:2560:flags=lanczos:force_original_aspect_ratio=decrease"
-      );
-      filters.push("pad=1440:2560:(ow-iw)/2:(oh-ih)/2:black");
-    } else if (exportTarget === "Square") {
-      filters.push(
-        "scale=1440:1440:flags=lanczos:force_original_aspect_ratio=decrease"
-      );
-      filters.push("pad=1440:1440:(ow-iw)/2:(oh-ih)/2:black");
-    } else {
-      filters.push(
-        "scale=2560:1440:flags=lanczos:force_original_aspect_ratio=decrease"
-      );
-      filters.push("pad=2560:1440:(ow-iw)/2:(oh-ih)/2:black");
-    }
-  } else {
-    if (exportTarget === "Vertical") {
-      filters.push(
-        "scale=1080:1920:flags=lanczos:force_original_aspect_ratio=decrease"
-      );
-      filters.push("pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black");
-    } else if (exportTarget === "Square") {
-      filters.push(
-        "scale=1080:1080:flags=lanczos:force_original_aspect_ratio=decrease"
-      );
-      filters.push("pad=1080:1080:(ow-iw)/2:(oh-ih)/2:black");
-    } else {
-      filters.push(
-        "scale=1920:1080:flags=lanczos:force_original_aspect_ratio=decrease"
-      );
-      filters.push("pad=1920:1080:(ow-iw)/2:(oh-ih)/2:black");
-    }
+  if (!job.originalUrl) {
+    throw new Error("originalUrl missing");
   }
 
-  // 3) Color grading أقوى وواضح
-  if (enableColorBoost) {
-    filters.push("eq=contrast=1.12:brightness=0.015:saturation=1.18:gamma=1.03");
-    filters.push("colorbalance=rs=0.015:gs=0.008:bs=-0.010");
-    filters.push("curves=all='0/0 0.20/0.16 0.50/0.55 0.80/0.90 1/1'");
-  }
-
-  // 4) Sharpen
-  if (enableSharpen) {
-    filters.push("unsharp=7:7:1.4:5:5:0.8");
-  } else {
-    filters.push("unsharp=5:5:0.6:3:3:0.3");
-  }
-
-  // 5) Frame smoothing
-  let fpsArgs = [];
-  if (enableFrameSmoothing) {
-    fpsArgs = ["-r", "60"];
-    filters.push("minterpolate=fps=60:mi_mode=mci:mc_mode=aobmc:me_mode=bidir");
-  }
-
-  // 6) Social export / توافق المنصات
-  if (enableSocialExport) {
-    filters.push("format=yuv420p");
-  }
-
-  let crf = "18";
-  let preset = "slow";
-
-  if (qualityLevel === "Ultra") {
-    crf = "15";
-    preset = "slow";
-  } else if (qualityLevel === "High") {
-    crf = "17";
-    preset = "slow";
-  } else if (qualityLevel === "Medium") {
-    crf = "20";
-    preset = "medium";
-  }
-
-  const args = ["-y", "-i", inputPath];
-
-  if (filters.length > 0) {
-    args.push("-vf", filters.join(","));
-  }
-
-  args.push(
-    ...fpsArgs,
-    "-c:v", "libx264",
-    "-preset", preset,
-    "-crf", crf,
-    "-profile:v", "high",
-    "-level", "4.2",
-    "-pix_fmt", "yuv420p",
-    "-movflags", "+faststart",
-    "-c:a", "aac",
-    "-b:a", "192k",
-    "-ar", "48000",
-    outputPath
+  const tempPath = path.join(
+    uploadsDir,
+    `remote-${Date.now()}-${Math.random()}.mp4`
   );
 
-  return args;
+  await downloadFile(job.originalUrl, tempPath);
+
+  return { inputPath: tempPath, isTemp: true };
 }
 
-// Placeholder للمستقبل
-function buildAiFfmpegArgs() {
-  throw new Error("AI mode is not implemented yet");
+// ============================
+// 🎯 FFmpeg Logic (نفسك + تحسين)
+// ============================
+function getProcessingMode(options = {}) {
+  const mode = normalizeString(options.processingMode, "").toLowerCase();
+
+  if (!mode) {
+    if (toBool(options.smartMode)) return "smart";
+    return "custom";
+  }
+
+  if (mode === "balance") return "balanced";
+
+  return ["smart", "fast", "balanced", "ultra", "custom"].includes(mode)
+    ? mode
+    : "custom";
 }
 
-function buildOutputFileName(mode) {
-  return `${mode}-output-${Date.now()}-${Math.round(Math.random() * 1e9)}.mp4`;
+function getEncodingByQuality(q = "High") {
+  if (q === "Ultra") return { crf: "14", preset: "slower" };
+  if (q === "High") return { crf: "17", preset: "slow" };
+  return { crf: "20", preset: "medium" };
 }
 
+function getModeProfile(mode, options = {}) {
+  const exportTarget = normalizeString(options.exportTarget, "Horizontal");
+  const encoding = getEncodingByQuality(options.qualityLevel);
+
+  return {
+    mode,
+    exportTarget,
+    useUpscale: true,
+    useDenoise: true,
+    useSharpen: true,
+    useColorBoost: true,
+    useFrameSmoothing: mode === "ultra",
+    ...encoding,
+  };
+}
+
+function buildFilterComplex(profile) {
+  const filters = [];
+
+  filters.push("format=yuv420p");
+
+  if (profile.useDenoise) {
+    filters.push("hqdn3d=1.4:1.4:6:6");
+  }
+
+  filters.push(
+    "scale=1920:1080:flags=lanczos+accurate_rnd+full_chroma_int"
+  );
+
+  if (profile.useSharpen) {
+    filters.push("unsharp=7:7:1.2:5:5:0.5");
+  }
+
+  const base = filters.join(",");
+
+  return `[0:v]${base}[vout]`;
+}
+
+function buildArgs(input, output, options) {
+  const mode = getProcessingMode(options);
+  const profile = getModeProfile(mode, options);
+  const filter = buildFilterComplex(profile);
+
+  return {
+    args: [
+      "-y",
+      "-i",
+      input,
+      "-filter_complex",
+      filter,
+      "-map",
+      "[vout]",
+      "-map",
+      "0:a?",
+      "-c:v",
+      "libx264",
+      "-preset",
+      profile.preset,
+      "-crf",
+      profile.crf,
+      "-movflags",
+      "+faststart",
+      "-c:a",
+      "aac",
+      "-b:a",
+      "192k",
+      output,
+    ],
+    profile,
+  };
+}
+
+// ============================
+// 🚀 WORKER
+// ============================
 const worker = new Worker(
   "video-processing",
   async (queueJob) => {
     const { jobId, options } = queueJob.data;
 
-    console.log(`[Worker] Starting queue job ${queueJob.id} for app job ${jobId}`);
-
     const job = await getJob(jobId);
-    if (!job) {
-      throw new Error(`App job ${jobId} not found`);
+    if (!job) throw new Error("Job not found");
+
+    const { inputPath, isTemp } = await resolveInputPath(job);
+
+    const outputFile = `out-${Date.now()}.mp4`;
+    const outputPath = path.join(uploadsDir, outputFile);
+
+    await updateJob(jobId, { status: "processing", progress: 30 });
+
+    const { args, profile } = buildArgs(inputPath, outputPath, options);
+
+    await execFileAsync(ffmpegPath, args);
+
+    // 🧹 حذف input المؤقت
+    if (isTemp && fs.existsSync(inputPath)) {
+      fs.unlinkSync(inputPath);
     }
 
-    const inputPath = path.join(uploadsDir, job.storedFileName);
-    if (!fs.existsSync(inputPath)) {
-      throw new Error(`Input file not found: ${inputPath}`);
+    await updateJob(jobId, { progress: 80 });
+
+    // 🔥 رفع إلى Cloudinary
+    const resultUrl = await uploadProcessedVideo(
+      outputPath,
+      jobId,
+      profile.mode
+    );
+
+    // 🧹 حذف output
+    if (fs.existsSync(outputPath)) {
+      fs.unlinkSync(outputPath);
     }
-
-    const processingMode = getProcessingMode(options);
-    const outputFileName = buildOutputFileName(processingMode);
-    const outputPath = path.join(uploadsDir, outputFileName);
-
-    await updateJob(jobId, {
-      status: "processing",
-      progress: 10,
-      currentStep: "analyzing",
-      currentStepLabel: "Analyzing",
-      currentModel: processingMode,
-      totalSteps: 1,
-      completedSteps: 0,
-      error: null,
-    });
-
-    let args;
-
-    if (processingMode === "ai") {
-      await updateJob(jobId, {
-        status: "processing",
-        progress: 20,
-        currentStep: "ai_prepare",
-        currentStepLabel: "Preparing AI processing",
-        currentModel: "ai",
-      });
-
-      args = buildAiFfmpegArgs(inputPath, outputPath, options);
-    } else {
-      await updateJob(jobId, {
-        status: "processing",
-        progress: 25,
-        currentStep: "non_ai_enhance",
-        currentStepLabel: "Enhancing with advanced filters",
-        currentModel: "ffmpeg-non-ai",
-      });
-
-      args = buildNonAiFfmpegArgs(inputPath, outputPath, options);
-    }
-
-    console.log(`[Worker] Input: ${inputPath}`);
-    console.log(`[Worker] Output: ${outputPath}`);
-    console.log(`[Worker] Mode: ${processingMode}`);
-    console.log(`[Worker] FFmpeg args: ${args.join(" ")}`);
-
-    await updateJob(jobId, {
-      status: "processing",
-      progress: 55,
-      currentStep: "rendering",
-      currentStepLabel: "Rendering video",
-      currentModel: processingMode,
-    });
-
-    const result = await execFileAsync(ffmpegPath, args);
-
-    if (result?.stdout) {
-      console.log("[Worker] FFmpeg stdout:", result.stdout);
-    }
-
-    if (result?.stderr) {
-      console.log("[Worker] FFmpeg stderr:", result.stderr);
-    }
-
-    await updateJob(jobId, {
-      status: "processing",
-      progress: 90,
-      currentStep: "finalizing",
-      currentStepLabel: "Finalizing",
-      currentModel: processingMode,
-      completedSteps: 1,
-    });
-
-    const baseUrl =
-      process.env.RENDER_EXTERNAL_URL || "http://localhost:5000";
-    const resultUrl = `${baseUrl}/uploads/${outputFileName}`;
 
     await updateJob(jobId, {
       status: "done",
       progress: 100,
       resultUrl,
-      currentStep: "done",
-      currentStepLabel: "Completed",
-      currentModel: null,
-      completedSteps: 1,
     });
 
-    console.log(`[Worker] Job ${jobId} completed: ${resultUrl}`);
-
-    return {
-      resultUrl,
-      processingMode,
-    };
+    return { resultUrl };
   },
-  {
-    connection,
-  }
+  { connection }
 );
 
-worker.on("completed", (job) => {
-  console.log(`[Worker] Queue job ${job.id} completed`);
-});
-
-worker.on("failed", async (job, error) => {
-  console.error(`[Worker] Queue job ${job?.id} failed:`, error);
-
-  try {
-    const appJobId = job?.data?.jobId;
-    if (appJobId) {
-      await updateJob(appJobId, {
-        status: "failed",
-        progress: 100,
-        error: error.message,
-        currentStep: "failed",
-        currentStepLabel: "Failed",
-        currentModel: null,
-      });
-    }
-  } catch (updateError) {
-    console.error("[Worker] Failed to mark app job as failed:", updateError);
-  }
-});
-
-console.log("🔥 Worker is running...");
+console.log("🔥 Worker running...");

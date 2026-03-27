@@ -3,10 +3,10 @@ require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
 const multer = require("multer");
-const path = require("path");
-const fs = require("fs");
 const { Queue } = require("bullmq");
 const IORedis = require("ioredis");
+const crypto = require("crypto");
+const { v2: cloudinary } = require("cloudinary");
 
 const app = express();
 app.set("trust proxy", true);
@@ -18,6 +18,12 @@ if (!process.env.REDIS_URL) {
   throw new Error("REDIS_URL is missing. Put it in your .env file.");
 }
 
+cloudinary.config({
+  cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+  api_key: process.env.CLOUDINARY_API_KEY,
+  api_secret: process.env.CLOUDINARY_API_SECRET,
+});
+
 const redis = new IORedis(process.env.REDIS_URL, {
   maxRetriesPerRequest: null,
   enableReadyCheck: false,
@@ -27,30 +33,17 @@ const videoQueue = new Queue("video-processing", {
   connection: redis,
 });
 
-const uploadsDir = path.join(__dirname, "uploads");
-
-if (!fs.existsSync(uploadsDir)) {
-  fs.mkdirSync(uploadsDir, { recursive: true });
-}
-
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => {
-    cb(null, uploadsDir);
-  },
-  filename: (req, file, cb) => {
-    const originalExt = path.extname(file.originalname) || ".mp4";
-    const uniqueName = `${Date.now()}-${Math.round(
-      Math.random() * 1e9
-    )}${originalExt}`;
-    cb(null, uniqueName);
+// نستخدم memoryStorage حتى ما نخزن ملفات محليًا على السيرفر
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: {
+    fileSize: 200 * 1024 * 1024,
   },
 });
 
-const upload = multer({ storage });
-
 app.use(cors());
-app.use(express.json());
-app.use("/uploads", express.static(uploadsDir));
+app.use(express.json({ limit: "10mb" }));
+app.use(express.urlencoded({ extended: true }));
 
 /* =========================
    Helpers
@@ -72,18 +65,33 @@ function normalizeString(value, fallback = "") {
   return normalized || fallback;
 }
 
-function getPublicBaseUrl(req) {
-  if (process.env.RENDER_EXTERNAL_URL) {
-    return process.env.RENDER_EXTERNAL_URL;
-  }
-  return `${req.protocol}://${req.get("host")}`;
+function makeJobId() {
+  if (crypto.randomUUID) return crypto.randomUUID();
+  return `${Date.now()}-${Math.round(Math.random() * 1e9)}`;
 }
 
 function buildAppliedEnhancements(options = {}) {
   const items = [];
+  const processingMode = normalizeString(options.processingMode).toLowerCase();
+
+  if (toBool(options.enableUpscale) || processingMode === "smart") {
+    items.push("Upscale");
+  }
+
+  if (toBool(options.enableDenoise) || processingMode === "smart") {
+    items.push("Denoise");
+  }
+
+  if (toBool(options.enableSharpen) || processingMode === "smart") {
+    items.push("Sharpen");
+  }
 
   if (toBool(options.enableColorBoost) || toBool(options.smartMode)) {
     items.push("Color Boost");
+  }
+
+  if (toBool(options.enableFrameSmoothing)) {
+    items.push("Frame Smoothing");
   }
 
   if (toBool(options.enableSocialExport) || toBool(options.smartMode)) {
@@ -98,29 +106,38 @@ function buildAppliedEnhancements(options = {}) {
     items.push(`Quality: ${options.qualityLevel}`);
   }
 
+  if (processingMode) {
+    items.push(`Mode: ${processingMode}`);
+  }
+
   return items;
 }
 
 function buildPipeline(options = {}) {
   const steps = [];
   const smartMode = toBool(options.smartMode);
+  const processingMode = normalizeString(options.processingMode, "").toLowerCase();
 
-  const wantsColorBoost = smartMode || toBool(options.enableColorBoost);
-  const wantsSocialExport = smartMode || toBool(options.enableSocialExport);
-  const hasQualityLevel = Boolean(normalizeString(options.qualityLevel));
-  const hasExportTarget = Boolean(normalizeString(options.exportTarget));
+  const wantsAnyProcessing =
+    smartMode ||
+    ["smart", "fast", "balance", "balanced", "ultra", "custom", "ai"].includes(
+      processingMode
+    ) ||
+    toBool(options.enableUpscale) ||
+    toBool(options.enableDenoise) ||
+    toBool(options.enableSharpen) ||
+    toBool(options.enableColorBoost) ||
+    toBool(options.enableFrameSmoothing) ||
+    toBool(options.enableSocialExport) ||
+    Boolean(normalizeString(options.qualityLevel)) ||
+    Boolean(normalizeString(options.exportTarget));
 
-  if (
-    wantsColorBoost ||
-    wantsSocialExport ||
-    hasQualityLevel ||
-    hasExportTarget
-  ) {
+  if (wantsAnyProcessing) {
     steps.push({
-      key: "finalExport",
-      label: "Final Export",
+      key: "videoEnhancement",
+      label: "Video Enhancement",
       type: "ffmpeg",
-      model: null,
+      model: processingMode || (smartMode ? "smart" : "custom"),
     });
   }
 
@@ -162,13 +179,38 @@ async function updateJob(jobId, updates) {
   return updated;
 }
 
+async function uploadBufferToCloudinary(fileBuffer, fileName = "video.mp4") {
+  return new Promise((resolve, reject) => {
+    const publicId = `crazyboost/input/${Date.now()}-${Math.round(
+      Math.random() * 1e9
+    )}`;
+
+    const stream = cloudinary.uploader.upload_stream(
+      {
+        resource_type: "video",
+        public_id: publicId,
+        use_filename: true,
+        unique_filename: true,
+        filename_override: fileName,
+        overwrite: false,
+      },
+      (error, result) => {
+        if (error) return reject(error);
+        resolve(result);
+      }
+    );
+
+    stream.end(fileBuffer);
+  });
+}
+
 /* =========================
    Routes
 ========================= */
 
 app.get("/", (req, res) => {
   res.json({
-    message: "CrazyBoost backend is running (Queue Mode)",
+    message: "CrazyBoost backend is running (Queue Mode + Cloudinary Mode)",
   });
 });
 
@@ -188,29 +230,72 @@ app.get("/health", async (req, res) => {
   }
 });
 
+// يدعم حالتين:
+// 1) videoUrl قادم من Flutter بعد رفع Cloudinary
+// 2) ملف مباشر كـ fallback
 app.post("/enhance", upload.single("video"), async (req, res) => {
   try {
-    if (!req.file) {
+    const options = req.body || {};
+    const providedVideoUrl = normalizeString(req.body?.videoUrl);
+    let originalUrl = providedVideoUrl;
+    let originalFileName = "video.mp4";
+    let storedFileName = `remote-source-${Date.now()}.mp4`;
+
+    if (!originalUrl && req.file) {
+      const uploaded = await uploadBufferToCloudinary(
+        req.file.buffer,
+        req.file.originalname || "video.mp4"
+      );
+
+      originalUrl = uploaded.secure_url;
+      originalFileName = req.file.originalname || "video.mp4";
+      storedFileName = uploaded.public_id || storedFileName;
+    }
+
+    if (!originalUrl) {
       return res.status(400).json({
         success: false,
-        error: "No video uploaded",
+        error: "No video provided. Send videoUrl or upload a video file.",
       });
     }
 
-    const jobId = Date.now().toString();
-    const publicBaseUrl = getPublicBaseUrl(req);
-    const publicVideoUrl = `${publicBaseUrl}/uploads/${req.file.filename}`;
-    const options = req.body || {};
+    if (req.file && !originalFileName) {
+      originalFileName = req.file.originalname || "video.mp4";
+    }
+
+    if (!req.file && providedVideoUrl) {
+      const cleanUrl = providedVideoUrl.split("?")[0];
+      const guessedName = cleanUrl.split("/").pop();
+      if (guessedName) {
+        originalFileName = guessedName;
+        storedFileName = guessedName;
+      }
+    }
+
+    const jobId = makeJobId();
     const appliedEnhancements = buildAppliedEnhancements(options);
     const pipeline = buildPipeline(options);
 
+    const normalizedOptions = {
+      smartMode: options.smartMode,
+      processingMode: normalizeString(options.processingMode),
+      enableUpscale: options.enableUpscale,
+      enableDenoise: options.enableDenoise,
+      enableSharpen: options.enableSharpen,
+      enableColorBoost: options.enableColorBoost,
+      enableFrameSmoothing: options.enableFrameSmoothing,
+      enableSocialExport: options.enableSocialExport,
+      exportTarget: normalizeString(options.exportTarget, "Horizontal"),
+      qualityLevel: normalizeString(options.qualityLevel, "High"),
+    };
+
     const jobData = {
       id: jobId,
-      fileName: req.file.originalname,
-      storedFileName: req.file.filename,
-      originalUrl: publicVideoUrl,
+      fileName: originalFileName,
+      storedFileName,
+      originalUrl,
       resultUrl: null,
-      options,
+      options: normalizedOptions,
       appliedEnhancements,
       status: "queued",
       progress: 5,
@@ -220,17 +305,17 @@ app.post("/enhance", upload.single("video"), async (req, res) => {
       currentStepLabel: "Queued",
       currentModel: null,
       pipeline,
-      totalSteps: pipeline.length,
+      totalSteps: Math.max(pipeline.length, 1),
       completedSteps: 0,
       error: null,
       queueJobId: null,
     };
 
     console.log("========================================");
-    console.log(`[Job ${jobId}] Video received:`, req.file.originalname);
-    console.log(`[Job ${jobId}] Stored as:`, req.file.filename);
-    console.log(`[Job ${jobId}] Public video URL:`, publicVideoUrl);
-    console.log(`[Job ${jobId}] Options:`, options);
+    console.log(`[Job ${jobId}] Video source ready`);
+    console.log(`[Job ${jobId}] Original file:`, originalFileName);
+    console.log(`[Job ${jobId}] Input URL:`, originalUrl);
+    console.log(`[Job ${jobId}] Options:`, normalizedOptions);
     console.log(`[Job ${jobId}] Applied enhancements:`, appliedEnhancements);
     console.log(`[Job ${jobId}] Pipeline:`, pipeline);
     console.log("========================================");
@@ -241,8 +326,7 @@ app.post("/enhance", upload.single("video"), async (req, res) => {
       "process-video",
       {
         jobId,
-        videoUrl: publicVideoUrl,
-        options,
+        options: normalizedOptions,
       },
       {
         removeOnComplete: 20,
@@ -254,26 +338,17 @@ app.post("/enhance", upload.single("video"), async (req, res) => {
       queueJobId: queuedJob.id,
       status: "queued",
       progress: 10,
-      currentStep: pipeline.length > 0 ? "queued" : "done",
-      currentStepLabel: pipeline.length > 0 ? "Queued" : "Completed",
+      currentStep: "queued",
+      currentStepLabel: "Queued",
     });
 
-    if (pipeline.length === 0) {
-      await updateJob(jobId, {
-        status: "done",
-        progress: 100,
-        resultUrl: publicVideoUrl,
-        currentStep: "done",
-        currentStepLabel: "Completed",
-      });
-    }
-
-    return res.json({
+    return res.status(202).json({
       success: true,
-      message: "Video received successfully",
+      message: "Processing job created successfully",
       jobId,
-      fileName: req.file.originalname,
-      options,
+      fileName: originalFileName,
+      inputUrl: originalUrl,
+      options: normalizedOptions,
       appliedEnhancements,
       pipeline,
     });
@@ -378,7 +453,6 @@ app.get("/result/:jobId", async (req, res) => {
 
 /* =========================
    Worker helper endpoints
-   (يستدعيها worker أو يحدّث Redis مباشرة)
 ========================= */
 
 app.post("/internal/job/:jobId/progress", async (req, res) => {
