@@ -3,7 +3,6 @@ const cors = require("cors");
 const multer = require("multer");
 const path = require("path");
 const fs = require("fs");
-const { fal } = require("@fal-ai/client");
 const { execFile } = require("child_process");
 const { promisify } = require("util");
 const ffmpegPath = require("ffmpeg-static");
@@ -40,24 +39,8 @@ app.use("/uploads", express.static(uploadsDir));
 
 const jobs = {};
 
-if (process.env.FAL_KEY) {
-  fal.config({
-    credentials: process.env.FAL_KEY,
-  });
-}
-
-const MODELS = {
-  crystal: "clarityai/crystal-video-upscaler",
-  film: "fal-ai/film/video",
-  reframe: "fal-ai/luma-dream-machine/ray-2/reframe",
-};
-
 function toBool(value) {
   return value === true || value === "true";
-}
-
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function getPublicBaseUrl(req) {
@@ -71,67 +54,19 @@ function getPublicBaseUrl(req) {
 function buildAppliedEnhancements(options = {}) {
   const items = [];
 
-  if (toBool(options.enableUpscale)) items.push("Upscale");
-  if (toBool(options.enableDenoise)) items.push("Denoise");
-  if (toBool(options.enableSharpen)) items.push("Sharpen");
-  if (toBool(options.enableColorBoost)) items.push("Color Boost");
-  if (toBool(options.enableFrameSmoothing)) items.push("Frame Smoothing");
-  if (toBool(options.enableSocialExport)) items.push("Social Export");
-  if (toBool(options.enableReframing)) items.push("Reframing");
+  if (toBool(options.enableColorBoost) || toBool(options.smartMode)) {
+    items.push("Color Boost");
+  }
+
+  if (options.exportTarget) {
+    items.push(`Export: ${options.exportTarget}`);
+  }
+
+  if (options.qualityLevel) {
+    items.push(`Quality: ${options.qualityLevel}`);
+  }
 
   return items;
-}
-
-function mapAspectRatio(exportTarget) {
-  switch (exportTarget) {
-    case "Vertical":
-      return "9:16";
-    case "Square":
-      return "1:1";
-    case "Horizontal":
-    default:
-      return "16:9";
-  }
-}
-
-function mapUpscaleFactor(qualityLevel) {
-  switch (qualityLevel) {
-    case "Ultra":
-      return 4;
-    case "High":
-      return 2;
-    case "Medium":
-    default:
-      return 2;
-  }
-}
-
-function computeProgress(currentStepIndex, totalSteps, state = "running") {
-  const start = 10;
-  const end = 95;
-
-  if (totalSteps <= 0) return 100;
-
-  const perStep = (end - start) / totalSteps;
-  const base = start + currentStepIndex * perStep;
-
-  if (state === "queued") return Math.round(base);
-  if (state === "running") return Math.round(base + perStep * 0.55);
-  if (state === "done") return Math.round(base + perStep);
-
-  return Math.round(base);
-}
-
-function extractResultVideoUrl(result) {
-  return (
-    result?.data?.video?.url ||
-    result?.data?.video_url ||
-    result?.data?.output?.url ||
-    result?.video?.url ||
-    result?.video_url ||
-    result?.output?.url ||
-    null
-  );
 }
 
 function getLocalUploadedPathFromUrl(videoUrl) {
@@ -204,65 +139,28 @@ function createOutputPath(prefix = "processed") {
   return path.join(uploadsDir, `${prefix}-${Date.now()}.mp4`);
 }
 
-function buildVideoPipeline(options = {}) {
-  const steps = [];
+function computeProgress(currentStepIndex, totalSteps, state = "running") {
+  const start = 10;
+  const end = 95;
 
-  const smartMode = toBool(options.smartMode);
+  if (totalSteps <= 0) return 100;
 
-  const wantsDenoise = smartMode || toBool(options.enableDenoise);
-  const wantsSharpen = smartMode || toBool(options.enableSharpen);
-  const wantsUpscale = smartMode || toBool(options.enableUpscale);
-  const wantsFrameSmoothing = toBool(options.enableFrameSmoothing);
-  const wantsReframing = toBool(options.enableReframing);
-  const wantsColorBoost = smartMode || toBool(options.enableColorBoost);
-  const wantsSocialExport = smartMode || toBool(options.enableSocialExport);
+  const perStep = (end - start) / totalSteps;
+  const base = start + currentStepIndex * perStep;
 
-  // تعطيل Topaz مؤقتًا لأنه سبب 422
-  if (wantsDenoise || wantsSharpen) {
-    steps.push({
-      key: "detailPrep",
-      label: "Detail Prep",
-      type: "skip",
-    });
-  }
+  if (state === "queued") return Math.round(base);
+  if (state === "running") return Math.round(base + perStep * 0.55);
+  if (state === "done") return Math.round(base + perStep);
 
-  if (wantsUpscale) {
-    steps.push({
-      key: "crystalUpscale",
-      label: "Crystal Upscale",
-      type: "fal",
-      model: MODELS.crystal,
-      buildInput: (videoUrl, opts) => ({
-        video_url: videoUrl,
-        scale_factor: mapUpscaleFactor(opts.qualityLevel),
-      }),
-    });
-  }
-
-  if (wantsFrameSmoothing) {
-  steps.push({
-    key: "frameSmoothing",
-    label: "Frame Smoothing",
-    type: "fal",
-    model: MODELS.film,
-    buildInput: (videoUrl) => ({
-      video_url: videoUrl
-    }),
-  });
+  return Math.round(base);
 }
 
-  if (wantsReframing) {
-    steps.push({
-      key: "reframing",
-      label: "Reframing",
-      type: "fal",
-      model: MODELS.reframe,
-      buildInput: (videoUrl, opts) => ({
-        video_url: videoUrl,
-        aspect_ratio: mapAspectRatio(opts.exportTarget),
-      }),
-    });
-  }
+function buildVideoPipeline(options = {}) {
+  const steps = [];
+  const smartMode = toBool(options.smartMode);
+
+  const wantsColorBoost = smartMode || toBool(options.enableColorBoost);
+  const wantsSocialExport = smartMode || toBool(options.enableSocialExport);
 
   if (
     wantsColorBoost ||
@@ -278,57 +176,6 @@ function buildVideoPipeline(options = {}) {
   }
 
   return steps;
-}
-
-async function runFalStep(job, step, inputVideoUrl, stepIndex) {
-  job.currentStep = step.key;
-  job.currentStepLabel = step.label;
-  job.currentModel = step.model;
-  job.progress = computeProgress(stepIndex, job.totalSteps, "queued");
-
-  const submitResult = await fal.queue.submit(step.model, {
-    input: step.buildInput(inputVideoUrl, job.options),
-  });
-
-  const requestId = submitResult.request_id;
-  job.activeRequestId = requestId;
-
-  while (true) {
-    const status = await fal.queue.status(step.model, {
-      requestId,
-      logs: true,
-    });
-
-    const falState = status.status;
-
-    if (falState === "IN_QUEUE") {
-      job.status = "processing";
-      job.progress = computeProgress(stepIndex, job.totalSteps, "queued");
-    } else if (falState === "IN_PROGRESS") {
-      job.status = "processing";
-      job.progress = computeProgress(stepIndex, job.totalSteps, "running");
-    } else if (falState === "COMPLETED") {
-      const result = await fal.queue.result(step.model, {
-        requestId,
-      });
-
-      const outputVideoUrl = extractResultVideoUrl(result);
-
-      if (!outputVideoUrl) {
-        throw new Error(
-          `Step "${step.key}" completed but no output video URL was returned`
-        );
-      }
-
-      job.completedSteps = stepIndex + 1;
-      job.progress = computeProgress(stepIndex, job.totalSteps, "done");
-      return outputVideoUrl;
-    } else if (falState === "FAILED" || falState === "CANCELLED") {
-      throw new Error(`AI step failed: ${step.key}`);
-    }
-
-    await sleep(2000);
-  }
 }
 
 function buildFfmpegArgs(inputPath, outputPath, options = {}) {
@@ -416,15 +263,6 @@ async function runFfmpegStep(job, step, inputVideoUrl, stepIndex, publicBaseUrl)
   return `${publicBaseUrl}/uploads/${path.basename(outputPath)}`;
 }
 
-async function runSkipStep(job, step, inputVideoUrl, stepIndex) {
-  job.currentStep = step.key;
-  job.currentStepLabel = step.label;
-  job.currentModel = null;
-  job.progress = computeProgress(stepIndex, job.totalSteps, "done");
-  job.completedSteps = stepIndex + 1;
-  return inputVideoUrl;
-}
-
 async function runPipeline(job, initialVideoUrl, publicBaseUrl) {
   const steps = buildVideoPipeline(job.options);
 
@@ -432,7 +270,7 @@ async function runPipeline(job, initialVideoUrl, publicBaseUrl) {
     key: step.key,
     label: step.label,
     type: step.type,
-    model: step.model || null,
+    model: null,
   }));
 
   job.totalSteps = steps.length;
@@ -457,9 +295,7 @@ async function runPipeline(job, initialVideoUrl, publicBaseUrl) {
   for (let i = 0; i < steps.length; i += 1) {
     const step = steps[i];
 
-    if (step.type === "fal") {
-      currentVideoUrl = await runFalStep(job, step, currentVideoUrl, i);
-    } else if (step.type === "ffmpeg") {
+    if (step.type === "ffmpeg") {
       currentVideoUrl = await runFfmpegStep(
         job,
         step,
@@ -467,8 +303,6 @@ async function runPipeline(job, initialVideoUrl, publicBaseUrl) {
         i,
         publicBaseUrl
       );
-    } else if (step.type === "skip") {
-      currentVideoUrl = await runSkipStep(job, step, currentVideoUrl, i);
     }
   }
 
@@ -478,11 +312,10 @@ async function runPipeline(job, initialVideoUrl, publicBaseUrl) {
   job.currentStep = "done";
   job.currentStepLabel = "Completed";
   job.currentModel = null;
-  job.activeRequestId = null;
 }
 
 app.get("/", (req, res) => {
-  res.json({ message: "CrazyBoost backend is running" });
+  res.json({ message: "CrazyBoost backend is running (No AI Version)" });
 });
 
 app.get("/health", (req, res) => {
@@ -491,13 +324,6 @@ app.get("/health", (req, res) => {
 
 app.post("/enhance", upload.single("video"), async (req, res) => {
   try {
-    if (!process.env.FAL_KEY) {
-      return res.status(500).json({
-        success: false,
-        error: "FAL_KEY is missing in environment variables",
-      });
-    }
-
     if (!req.file) {
       return res.status(400).json({
         success: false,
