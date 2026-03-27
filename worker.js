@@ -72,62 +72,94 @@ async function updateJob(jobId, updates) {
   return updated;
 }
 
-function buildBestFfmpegArgs(inputPath, outputPath, options = {}) {
+function getProcessingMode(options = {}) {
+  const mode = normalizeString(options.processingMode, "");
+  if (mode) return mode.toLowerCase();
+
+  // افتراضيًا الآن كل شيء non-ai
+  return "non-ai";
+}
+
+function buildNonAiFfmpegArgs(inputPath, outputPath, options = {}) {
   const filters = [];
 
   const smartMode = toBool(options.smartMode);
-  const colorBoost = smartMode || toBool(options.enableColorBoost);
-  const socialExport = smartMode || toBool(options.enableSocialExport);
+
+  const enableUpscale = smartMode || toBool(options.enableUpscale);
+  const enableDenoise = smartMode || toBool(options.enableDenoise);
+  const enableSharpen = smartMode || toBool(options.enableSharpen);
+  const enableColorBoost = smartMode || toBool(options.enableColorBoost);
+  const enableFrameSmoothing = toBool(options.enableFrameSmoothing);
+  const enableSocialExport = smartMode || toBool(options.enableSocialExport);
 
   const exportTarget = normalizeString(options.exportTarget, "Horizontal");
   const qualityLevel = normalizeString(options.qualityLevel, "High");
 
-  // تحسين بصري قوي بدون AI:
-  // - ألوان محسنة بشكل طبيعي
-  // - وضوح أفضل بدون مبالغة
-  // - توازن جيد للسوشال
-  if (colorBoost) {
-    filters.push(
-      "eq=saturation=1.08:contrast=1.06:brightness=0.01"
-    );
-    filters.push(
-      "unsharp=5:5:0.8:3:3:0.4"
-    );
-    filters.push(
-      "colorbalance=rs=0.01:gs=0.01:bs=-0.005"
-    );
-  } else {
-    filters.push(
-      "unsharp=5:5:0.5:3:3:0.2"
-    );
+  // 1) Denoise
+  if (enableDenoise) {
+    filters.push("hqdn3d=1.5:1.5:6:6");
   }
 
-  // تجهيز أبعاد احترافية
-  if (exportTarget === "Vertical") {
-    filters.push(
-      "scale=1080:1920:force_original_aspect_ratio=decrease"
-    );
-    filters.push(
-      "pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black"
-    );
-  } else if (exportTarget === "Square") {
-    filters.push(
-      "scale=1080:1080:force_original_aspect_ratio=decrease"
-    );
-    filters.push(
-      "pad=1080:1080:(ow-iw)/2:(oh-ih)/2:black"
-    );
+  // 2) Upscale / Resize بجودة عالية
+  if (enableUpscale) {
+    if (exportTarget === "Vertical") {
+      filters.push(
+        "scale=1440:2560:flags=lanczos:force_original_aspect_ratio=decrease"
+      );
+      filters.push("pad=1440:2560:(ow-iw)/2:(oh-ih)/2:black");
+    } else if (exportTarget === "Square") {
+      filters.push(
+        "scale=1440:1440:flags=lanczos:force_original_aspect_ratio=decrease"
+      );
+      filters.push("pad=1440:1440:(ow-iw)/2:(oh-ih)/2:black");
+    } else {
+      filters.push(
+        "scale=2560:1440:flags=lanczos:force_original_aspect_ratio=decrease"
+      );
+      filters.push("pad=2560:1440:(ow-iw)/2:(oh-ih)/2:black");
+    }
   } else {
-    filters.push(
-      "scale=1920:1080:force_original_aspect_ratio=decrease"
-    );
-    filters.push(
-      "pad=1920:1080:(ow-iw)/2:(oh-ih)/2:black"
-    );
+    if (exportTarget === "Vertical") {
+      filters.push(
+        "scale=1080:1920:flags=lanczos:force_original_aspect_ratio=decrease"
+      );
+      filters.push("pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black");
+    } else if (exportTarget === "Square") {
+      filters.push(
+        "scale=1080:1080:flags=lanczos:force_original_aspect_ratio=decrease"
+      );
+      filters.push("pad=1080:1080:(ow-iw)/2:(oh-ih)/2:black");
+    } else {
+      filters.push(
+        "scale=1920:1080:flags=lanczos:force_original_aspect_ratio=decrease"
+      );
+      filters.push("pad=1920:1080:(ow-iw)/2:(oh-ih)/2:black");
+    }
   }
 
-  // تجهيز إضافي للمنصات
-  if (socialExport) {
+  // 3) Color grading أقوى وواضح
+  if (enableColorBoost) {
+    filters.push("eq=contrast=1.12:brightness=0.015:saturation=1.18:gamma=1.03");
+    filters.push("colorbalance=rs=0.015:gs=0.008:bs=-0.010");
+    filters.push("curves=all='0/0 0.20/0.16 0.50/0.55 0.80/0.90 1/1'");
+  }
+
+  // 4) Sharpen
+  if (enableSharpen) {
+    filters.push("unsharp=7:7:1.4:5:5:0.8");
+  } else {
+    filters.push("unsharp=5:5:0.6:3:3:0.3");
+  }
+
+  // 5) Frame smoothing
+  let fpsArgs = [];
+  if (enableFrameSmoothing) {
+    fpsArgs = ["-r", "60"];
+    filters.push("minterpolate=fps=60:mi_mode=mci:mc_mode=aobmc:me_mode=bidir");
+  }
+
+  // 6) Social export / توافق المنصات
+  if (enableSocialExport) {
     filters.push("format=yuv420p");
   }
 
@@ -135,13 +167,13 @@ function buildBestFfmpegArgs(inputPath, outputPath, options = {}) {
   let preset = "slow";
 
   if (qualityLevel === "Ultra") {
-    crf = "16";
+    crf = "15";
     preset = "slow";
   } else if (qualityLevel === "High") {
-    crf = "18";
+    crf = "17";
     preset = "slow";
   } else if (qualityLevel === "Medium") {
-    crf = "21";
+    crf = "20";
     preset = "medium";
   }
 
@@ -152,6 +184,7 @@ function buildBestFfmpegArgs(inputPath, outputPath, options = {}) {
   }
 
   args.push(
+    ...fpsArgs,
     "-c:v", "libx264",
     "-preset", preset,
     "-crf", crf,
@@ -166,6 +199,15 @@ function buildBestFfmpegArgs(inputPath, outputPath, options = {}) {
   );
 
   return args;
+}
+
+// Placeholder للمستقبل
+function buildAiFfmpegArgs() {
+  throw new Error("AI mode is not implemented yet");
+}
+
+function buildOutputFileName(mode) {
+  return `${mode}-output-${Date.now()}-${Math.round(Math.random() * 1e9)}.mp4`;
 }
 
 const worker = new Worker(
@@ -185,37 +227,57 @@ const worker = new Worker(
       throw new Error(`Input file not found: ${inputPath}`);
     }
 
-    const outputFileName = `finalExport-${Date.now()}-${Math.round(
-      Math.random() * 1e9
-    )}.mp4`;
+    const processingMode = getProcessingMode(options);
+    const outputFileName = buildOutputFileName(processingMode);
     const outputPath = path.join(uploadsDir, outputFileName);
-
-    const args = buildBestFfmpegArgs(inputPath, outputPath, options);
 
     await updateJob(jobId, {
       status: "processing",
-      progress: 15,
+      progress: 10,
       currentStep: "analyzing",
       currentStepLabel: "Analyzing",
-      currentModel: null,
+      currentModel: processingMode,
       totalSteps: 1,
       completedSteps: 0,
       error: null,
     });
 
-    console.log(`[Worker] Preparing ffmpeg for job ${jobId}`);
+    let args;
+
+    if (processingMode === "ai") {
+      await updateJob(jobId, {
+        status: "processing",
+        progress: 20,
+        currentStep: "ai_prepare",
+        currentStepLabel: "Preparing AI processing",
+        currentModel: "ai",
+      });
+
+      args = buildAiFfmpegArgs(inputPath, outputPath, options);
+    } else {
+      await updateJob(jobId, {
+        status: "processing",
+        progress: 25,
+        currentStep: "non_ai_enhance",
+        currentStepLabel: "Enhancing with advanced filters",
+        currentModel: "ffmpeg-non-ai",
+      });
+
+      args = buildNonAiFfmpegArgs(inputPath, outputPath, options);
+    }
+
+    console.log(`[Worker] Input: ${inputPath}`);
+    console.log(`[Worker] Output: ${outputPath}`);
+    console.log(`[Worker] Mode: ${processingMode}`);
+    console.log(`[Worker] FFmpeg args: ${args.join(" ")}`);
 
     await updateJob(jobId, {
       status: "processing",
-      progress: 35,
-      currentStep: "finalExport",
-      currentStepLabel: "Enhancing & Exporting",
-      currentModel: "ffmpeg",
+      progress: 55,
+      currentStep: "rendering",
+      currentStepLabel: "Rendering video",
+      currentModel: processingMode,
     });
-
-    console.log(`[Worker] FFmpeg input: ${inputPath}`);
-    console.log(`[Worker] FFmpeg output: ${outputPath}`);
-    console.log(`[Worker] FFmpeg args: ${args.join(" ")}`);
 
     const result = await execFileAsync(ffmpegPath, args);
 
@@ -227,18 +289,18 @@ const worker = new Worker(
       console.log("[Worker] FFmpeg stderr:", result.stderr);
     }
 
-    const baseUrl =
-      process.env.RENDER_EXTERNAL_URL || "http://localhost:5000";
-    const resultUrl = `${baseUrl}/uploads/${outputFileName}`;
-
     await updateJob(jobId, {
       status: "processing",
       progress: 90,
       currentStep: "finalizing",
       currentStepLabel: "Finalizing",
-      currentModel: null,
+      currentModel: processingMode,
       completedSteps: 1,
     });
+
+    const baseUrl =
+      process.env.RENDER_EXTERNAL_URL || "http://localhost:5000";
+    const resultUrl = `${baseUrl}/uploads/${outputFileName}`;
 
     await updateJob(jobId, {
       status: "done",
@@ -254,6 +316,7 @@ const worker = new Worker(
 
     return {
       resultUrl,
+      processingMode,
     };
   },
   {
